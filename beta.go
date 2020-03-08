@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"sync"
 )
 
 type Message struct {
@@ -13,12 +14,13 @@ type CounterMap map[uint32]*Message
 
 type Messages struct {
 	cm CounterMap
-	// mtx sync.
+	mtx sync.Mutex
 }
 
 func NewMap() *Messages {
 	m := &Messages{
 		cm: make(CounterMap),
+		mtx: sync.Mutex,
 	}
 	return m
 }
@@ -39,17 +41,23 @@ func (m *Messages) sum(b []byte) uint32 {
 	return Sum32(b)
 }
 
+// Insert stores unique messages, and increments count for non-unique messages.
 func (m *Messages) Insert(b []byte) bool {
+	m.mtx.Lock()
+	defer m.mtx.Unlock()
 	sum := m.sum(b)
 	if _, ok := m.cm[sum]; !ok {
-		m.cm[sum] = &Message{b, 1}
+		m.cm[sum] = &Message{b, 0}
 		return true
 	}
 	m.cm[sum].count++
 	return false
 }
 
+// Iter is an iterator-like method for data in the duplicate messages map.
 func (m *Messages) Iter() chan *Message {
+	m.mtx.Lock()
+	defer m.mtx.Unlock()
 	c := make(chan *Message, 1)
 	go func() {
 		for _, v := range m.cm {
@@ -61,18 +69,7 @@ func (m *Messages) Iter() chan *Message {
 	return c
 }
 
-// func main() {
-// 	m := NewMap()
-// 	m.Insert([]byte("foo"))
-// 	m.Insert([]byte("foo"))
-// 	m.Insert([]byte("bar"))
-// 	m.Insert([]byte("baz"))
-// 	m.Insert([]byte("baz"))
-// 	m.Insert([]byte("baz"))
-// 	m.Insert([]byte("foo"))
-// 	m.Insert([]byte("bar"))
-
-// 	for v := range m.Iter() {
-// 		fmt.Printf("%s => %d\n", v.data, v.count)
-// 	}
-// }
+// Reset clears the counter map structure.
+func (m *Messages) Reset() {
+	m.cm = make(CounterMap)
+}

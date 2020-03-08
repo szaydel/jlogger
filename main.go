@@ -13,7 +13,6 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
-	// "regexp"
 
 	"github.com/go-redis/redis/v7"
 )
@@ -161,7 +160,7 @@ type topics struct {
 	json            chan []byte
 	plaintext       chan []byte
 	syslogjson      chan map[string]interface{}
-	syslogplaintext chan string
+	syslogplaintext chan []byte
 }
 
 type SyslogFunc func(string) error
@@ -224,60 +223,73 @@ func stats(stats chan stat, c chan string) {
 	}
 }
 
-func dupesNotification(m *Message) map[string]interface{} {
+// dupesNotification creates a map which contains the original message body,
+// and if original was decoded JSON, then only contents of "msg" or "message"
+// field, or entire message if original was not valid JSON, and includes number
+// of times this message occurred over a given period in seconds.
+func dupesNotification(m *Message, dur time.Duration) map[string]interface{} {
+	var dup = make(map[string]interface{})
 	if !json.Valid(m.data) {
-		dup := make(map[string]interface{})
-		dup["repeated"] = m.count
 		dup["message"] = string(m.data)
-		return dup
+	} else {
+		json.Unmarshal(m.data, &dup)
 	}
-	dup := make(map[string]interface{})
-	json.Unmarshal(m.data, &dup)
+	dup["level"] = "INFO"
+	dup["period"] = dur.String()
 	dup["repeated"] = m.count
+	dup["timestamp"] = time.Now().Format(time.RFC3339Nano)
 	return dup
 }
 
-func dispatch(t *topics) {
-	dupesMap := NewMap()
-	scnr := bufio.NewScanner(os.Stdin)
-	ticker := time.NewTicker(time.Second * 5)
+func periodicDupesProcessing(t *topics, dupes *Messages) {
+	var ticker = time.NewTicker(time.Second * 5)
+	var timestamp = time.Now()
 	for {
 		select {
 		case <- ticker.C:
-			for v := range dupesMap.Iter() {
-				log.Printf(">> %v", dupesNotification(v))
-				// j, _ := json.Marshal(dupesNotification(v))
-				// t.json <- j
+			delta := time.Now().Sub(timestamp)
+			for v := range dupes.Iter() {
+				if v.count > 0 {
+					log.Printf( ">> %v", dupesNotification(v, delta))
+					j, _ := json.Marshal(dupesNotification(v, delta))
+					t.json <- j
+				}
 			}
-		default:
-			scnr.Scan()
-			if ! dupesMap.Insert(scnr.Bytes()) {
-				continue
-			}
-			txt := scnr.Text()
-			// If this is valid JSON, publish it to a JSON messages channel, else
-			// it goes to the plaintext channel.
-			if !json.Valid(scnr.Bytes()) {
-				log.Println("-> plaintext")
-				t.syslogplaintext <- txt
-				t.plaintext <- scnr.Bytes()
-			} else {
-				t.json <- scnr.Bytes()
-				var m = make(map[string]interface{})
-				json.Unmarshal(scnr.Bytes(), &m)
-				t.syslogjson <- m
-				log.Println("-> json")
-			}
+			dupes.Reset()
+			timestamp = time.Now() // update timestamp for next report
 		}
 	}
 }
 
-func publishToSyslog(c <-chan string, w io.Writer, stats chan<- stat) {
+func dispatch(t *topics, dupes *Messages) {
+	var scnr = bufio.NewScanner(os.Stdin)
+	for scnr.Scan() {
+		if ! dupes.Insert(scnr.Bytes()) {
+			continue
+		}
+		//txt := scnr.Text()
+		// If this is valid JSON, publish it to a JSON messages channel, else
+		// it goes to the plaintext channel.
+		if !json.Valid(scnr.Bytes()) {
+			log.Println("-> plaintext")
+			t.syslogplaintext <- scnr.Bytes()
+			t.plaintext <- scnr.Bytes()
+		} else {
+			t.json <- scnr.Bytes()
+			var m = make(map[string]interface{})
+			json.Unmarshal(scnr.Bytes(), &m)
+			t.syslogjson <- m
+			log.Println("-> json")
+		}
+	}
+}
+
+func publishToSyslog(c <-chan []byte, w io.Writer, stats chan<- stat) {
 	for {
-		if _, err := fmt.Fprintf(w, <-c); err != nil {
+		if _, err := fmt.Fprintf(w, "%s", <-c); err != nil {
 			panic(err)
 		}
-		stats <- Plain
+		// stats <- Plain
 	}
 }
 
@@ -312,8 +324,9 @@ func publishToSyslogJSON(
 			levelStr = levelToStr(defaultLevel, "")
 			obj["level"] = levelStr
 		}
-		stats <- mapLevelToStat[levelStr]
-		stats <- Json // This is a JSON-serialized message
+		_ = mapLevelToStat
+		// stats <- mapLevelToStat[levelStr]
+		// stats <- Json // This is a JSON-serialized message
 		// else {
 		// 	obj["level"] = levelStr
 		// }
@@ -377,8 +390,11 @@ func main() {
 		json:            make(chan []byte),
 		plaintext:       make(chan []byte),
 		syslogjson:      make(chan map[string]interface{}),
-		syslogplaintext: make(chan string),
+		syslogplaintext: make(chan []byte),
 	}
+
+	// Initialize duplicate messages structure
+	dupes := NewMap()
 
 	statsChannel := make(chan stat)
 	// go stats(statsChannel, chans.json)
@@ -389,7 +405,8 @@ func main() {
 	go publishToTopic(chans.json, "json_msgs", rdb)
 	// Publish plaintext messages to plaintext channel
 	go publishToTopic(chans.plaintext, "plain_msgs", rdb)
-	go dispatch(chans)
+	go dispatch(chans, dupes)
+	go periodicDupesProcessing(chans, dupes)
 
 	<-doneChan
 	close(chans.json)
