@@ -1,7 +1,7 @@
 package main
 
 import (
-	"time"
+	"bytes"
 	"bufio"
 	"encoding/json"
 	"flag"
@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/go-redis/redis/v7"
 )
@@ -156,13 +157,6 @@ func levelToStr(level syslog.Priority, defaultLevelStr string) string {
 	return defaultLevelStr
 }
 
-type topics struct {
-	json            chan []byte
-	plaintext       chan []byte
-	syslogjson      chan map[string]interface{}
-	syslogplaintext chan []byte
-}
-
 type SyslogFunc func(string) error
 
 func loggerfn(level syslog.Priority, w *syslog.Writer) SyslogFunc {
@@ -177,7 +171,8 @@ func loggerfn(level syslog.Priority, w *syslog.Writer) SyslogFunc {
 	return mapLevelToFunc[level]
 }
 
-type stat int16
+type stat uint16
+
 const (
 	Plain stat = iota
 	Json
@@ -189,35 +184,43 @@ const (
 	Debug
 	Unknown
 )
-
-func stats(stats chan stat, c chan string) {
-	const interval = 1000
+// stats tracks number of unique messages received. Levels are only extracted
+// from JSON messages where object contains field called "level", and that
+// field contains a name known to this utility.
+func (p *Publish) stats() {
+	const interval = 10
+	// Counters is meant to be private, but it is "exported" in order to be
+	// JSON-marshal(able). In reality, it is not visible outside of this method.
 	type Counters struct {
-		Plain int64 `json:"plaintext"`
-		Json int64 `json:"json_encoded"`
-		Crit int64 `json:"critical"`
-		Err int64 `json:"error"`
+		Plain   int64 `json:"plaintext"`
+		Json    int64 `json:"json_encoded"`
+		Crit    int64 `json:"critical"`
+		Err     int64 `json:"error"`
 		Warning int64 `json:"warning"`
-		Notice int64 `json:"notice"`
-		Info int64 `json:"info"`
-		Debug int64 `json:"debug"`
+		Notice  int64 `json:"notice"`
+		Info    int64 `json:"info"`
+		Debug   int64 `json:"debug"`
 	}
 	var counts [Unknown]int64
 	for {
 		select {
-		case <-time.Tick(interval*time.Second):
+		case <-time.Tick(interval * time.Second):
 
-			b, _:= json.Marshal(
-				Counters{
+			b, _ := json.Marshal(
+				map[string]interface{}{
+				"counts": Counters{
 					Plain: counts[Plain],
-					Json: counts[Json],
+					Json:  counts[Json],
+				},
+				"source": p.source,
 				},
 			)
 			log.Printf("%s", string(b))
+			// Reset the counts after proceessing and reporting stats.
 			for i, _ := range counts {
 				counts[i] = 0
 			}
-		case v := <-stats:
+		case v := <-p.statsChan:
 			counts[v]++
 		}
 	}
@@ -227,7 +230,7 @@ func stats(stats chan stat, c chan string) {
 // and if original was decoded JSON, then only contents of "msg" or "message"
 // field, or entire message if original was not valid JSON, and includes number
 // of times this message occurred over a given period in seconds.
-func dupesNotification(m *Message, dur time.Duration) map[string]interface{} {
+func dupesNotification(m *Message, td time.Duration) map[string]interface{} {
 	var dup = make(map[string]interface{})
 	if !json.Valid(m.data) {
 		dup["message"] = string(m.data)
@@ -235,24 +238,29 @@ func dupesNotification(m *Message, dur time.Duration) map[string]interface{} {
 		json.Unmarshal(m.data, &dup)
 	}
 	dup["level"] = "INFO"
-	dup["period"] = dur.String()
+	dup["period"] = td.String()
 	dup["repeated"] = m.count
 	dup["timestamp"] = time.Now().Format(time.RFC3339Nano)
 	return dup
 }
 
-func periodicDupesProcessing(t *topics, dupes *Messages) {
-	var ticker = time.NewTicker(time.Second * 5)
+// periodicDupesProcessing on a regular basis produces an informational entry 
+// for each message which was encountered more than once during previous
+// interval.
+func periodicDupesProcessing(p *Publish, dupes *Messages) {
+	const interval = 10
+	var t = p.chans
+	var ticker = time.NewTicker(interval * time.Second)
 	var timestamp = time.Now()
 	for {
 		select {
-		case <- ticker.C:
+		case <-ticker.C:
 			delta := time.Now().Sub(timestamp)
 			for v := range dupes.Iter() {
 				if v.count > 0 {
-					log.Printf( ">> %v", dupesNotification(v, delta))
-					j, _ := json.Marshal(dupesNotification(v, delta))
-					t.json <- j
+					m := dupesNotification(v, delta)
+					m["source"] = p.source
+					t.json <- m
 				}
 			}
 			dupes.Reset()
@@ -261,35 +269,54 @@ func periodicDupesProcessing(t *topics, dupes *Messages) {
 	}
 }
 
-func dispatch(t *topics, dupes *Messages) {
+func dispatch(p *Publish, dupes *Messages) {
+	var t = p.chans
 	var scnr = bufio.NewScanner(os.Stdin)
+	var validJSON bool
 	for scnr.Scan() {
-		if ! dupes.Insert(scnr.Bytes()) {
+		var content bytes.Buffer
+		validJSON = json.Valid(scnr.Bytes())
+		var m = make(map[string]interface{})
+		// When message is a JSON object, we want to use just the contents of
+		// "msg" or "message" field for the purposes of establishing uniqueness
+		// of the message. Because it is a serialized object, which likely
+		// contains continuously variable fields such as a timestamp, we want to
+		// only focus on the actual log text and ignore any associated metadata.
+		if validJSON {
+			json.Unmarshal(scnr.Bytes(), &m)
+			if v, ok := getValue("msg", m); ok {
+				content.WriteString(v)
+			} else if v, ok := getValue("message", m); ok {
+				content.WriteString(v)
+			} else {
+				continue
+			}
+		} else {
+			content.Write(scnr.Bytes())
+		}
+
+		if !dupes.Insert(content.Bytes()) {
 			continue
 		}
-		//txt := scnr.Text()
+
 		// If this is valid JSON, publish it to a JSON messages channel, else
 		// it goes to the plaintext channel.
-		if !json.Valid(scnr.Bytes()) {
+		if !validJSON {
 			log.Println("-> plaintext")
 			t.syslogplaintext <- scnr.Bytes()
 			t.plaintext <- scnr.Bytes()
 		} else {
-			t.json <- scnr.Bytes()
-			var m = make(map[string]interface{})
-			json.Unmarshal(scnr.Bytes(), &m)
+			// var m = make(map[string]interface{})
+			// json.Unmarshal(scnr.Bytes(), &m)
+			// When "source" key does not exist, we use the tag `-t` with which
+			// this program was started.
+			if _, ok := getValue("source", m); !ok {
+				m["source"] = p.source
+			}
+			t.json <- m
 			t.syslogjson <- m
 			log.Println("-> json")
 		}
-	}
-}
-
-func publishToSyslog(c <-chan []byte, w io.Writer, stats chan<- stat) {
-	for {
-		if _, err := fmt.Fprintf(w, "%s", <-c); err != nil {
-			panic(err)
-		}
-		// stats <- Plain
 	}
 }
 
@@ -300,24 +327,67 @@ func getValue(k string, m map[string]interface{}) (string, bool) {
 	return "", false
 }
 
-func publishToSyslogJSON(
-	c <-chan map[string]interface{},
+type topics struct {
+	json            chan map[string]interface{}
+	plaintext       chan []byte
+	syslogjson      chan map[string]interface{}
+	syslogplaintext chan []byte
+}
+
+type Publish struct {
+	chans     *topics
+	statsChan chan stat
+	source string
+}
+
+func (p *Publish) Close() {
+	close(p.chans.json)
+	close(p.chans.plaintext)
+	close(p.chans.syslogjson)
+	close(p.chans.syslogplaintext)
+	close(p.statsChan)
+}
+
+func NewPublish(source string) *Publish {
+	return &Publish{
+		chans: &topics{
+			json:            make(chan map[string]interface{}),
+			plaintext:       make(chan []byte),
+			syslogjson:      make(chan map[string]interface{}),
+			syslogplaintext: make(chan []byte),
+		},
+		statsChan: make(chan stat),
+		source: source,
+	}
+}
+
+func (p *Publish) publishToSyslog(
+	w io.Writer,
+) {
+	for {
+		if _, err := fmt.Fprintf(w, "%s", <-p.chans.syslogplaintext); err != nil {
+			panic(err)
+		}
+		p.statsChan <- Plain
+	}
+}
+
+func (p *Publish) publishToSyslogJSON(
 	w *syslog.Writer,
 	defaultLevel syslog.Priority,
-	stats chan<- stat,
 ) {
 	mapLevelToStat := map[string]stat{
-		"crit": Crit,
-		"err": Err,
-		"error": Err,
-		"warn": Warning,
+		"crit":    Crit,
+		"err":     Err,
+		"error":   Err,
+		"warn":    Warning,
 		"warning": Warning,
-		"notice": Notice,
-		"info": Info,
-		"debug": Debug,
+		"notice":  Notice,
+		"info":    Info,
+		"debug":   Debug,
 	}
 	for {
-		obj := <-c
+		obj := <-p.chans.syslogjson
 		var levelStr string
 		var ok bool
 		if levelStr, ok = getValue("level", obj); !ok {
@@ -325,11 +395,8 @@ func publishToSyslogJSON(
 			obj["level"] = levelStr
 		}
 		_ = mapLevelToStat
-		// stats <- mapLevelToStat[levelStr]
-		// stats <- Json // This is a JSON-serialized message
-		// else {
-		// 	obj["level"] = levelStr
-		// }
+		p.statsChan <- mapLevelToStat[levelStr]
+		p.statsChan <- Json // This is a JSON-serialized message
 		// Expect that message key could be either "msg" or "message".
 		// If neither is found, or not a string value, we abandon processing
 		// this particular object.
@@ -347,14 +414,23 @@ func publishToSyslogJSON(
 	}
 }
 
-func publishToTopic(c chan []byte, topic string, rdb *redis.Client) {
-	pubsub := rdb.Subscribe(topic)
-	if _, err := pubsub.Receive(); err != nil {
+func (p *Publish) publishToTopic(rdb *redis.Client) {
+	pubsub1 := rdb.Subscribe("json_msgs")
+	if _, err := pubsub1.Receive(); err != nil {
+		panic(err)
+	}
+	pubsub2 := rdb.Subscribe("plain_msgs")
+	if _, err := pubsub2.Receive(); err != nil {
 		panic(err)
 	}
 	for {
-		msg := <-c
-		rdb.Publish(topic, msg)
+		select {
+		case msg := <-p.chans.json:
+			msgEncoded, _ := json.Marshal(msg)
+			rdb.Publish("json_msgs", msgEncoded)
+		case msg := <-p.chans.plaintext:
+			rdb.Publish("plain_msgs", msg)
+		}
 	}
 }
 
@@ -386,29 +462,25 @@ func main() {
 		log.Fatal(err)
 	}
 
-	chans := &topics{
-		json:            make(chan []byte),
-		plaintext:       make(chan []byte),
-		syslogjson:      make(chan map[string]interface{}),
-		syslogplaintext: make(chan []byte),
-	}
+	// Setup pipelines
+	p := NewPublish(cliArgs.tag)
 
 	// Initialize duplicate messages structure
 	dupes := NewMap()
 
-	statsChannel := make(chan stat)
-	// go stats(statsChannel, chans.json)
-	go publishToSyslogJSON(chans.syslogjson, sysLog, strToLevel(cliArgs.priority, syslog.LOG_NOTICE), statsChannel)
-	// Publish plaintext messages to system log
-	go publishToSyslog(chans.syslogplaintext, sysLog, statsChannel)
-	// Publish json messages to json channel
-	go publishToTopic(chans.json, "json_msgs", rdb)
-	// Publish plaintext messages to plaintext channel
-	go publishToTopic(chans.plaintext, "plain_msgs", rdb)
-	go dispatch(chans, dupes)
-	go periodicDupesProcessing(chans, dupes)
+	// Start statistics processing goroutine
+	go p.stats()
+	// Start syslog writing goroutine for JSON messages
+	go p.publishToSyslogJSON(sysLog, strToLevel(cliArgs.priority, syslog.LOG_NOTICE))
+	// Start syslog writing goroutine for plaintext messages
+	go p.publishToSyslog(sysLog)
+	// Start Redis publishing goroutine
+	go p.publishToTopic(rdb)
+	// Start dispatch goroutine (it feeds the publishing goroutines)
+	go dispatch(p, dupes)
+	// Start duplicate message processing goroutine
+	go periodicDupesProcessing(p, dupes)
 
 	<-doneChan
-	close(chans.json)
-	close(chans.plaintext)
+	p.Close()
 }

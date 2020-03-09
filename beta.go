@@ -20,7 +20,7 @@ type Messages struct {
 func NewMap() *Messages {
 	m := &Messages{
 		cm: make(CounterMap),
-		mtx: sync.Mutex,
+		mtx: sync.Mutex{},
 	}
 	return m
 }
@@ -71,5 +71,7 @@ func (m *Messages) Iter() chan *Message {
 
 // Reset clears the counter map structure.
 func (m *Messages) Reset() {
+	m.mtx.Lock()
+	defer m.mtx.Unlock()
 	m.cm = make(CounterMap)
 }
