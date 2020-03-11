@@ -1,8 +1,8 @@
 package main
 
 import (
-	"bytes"
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -59,6 +59,7 @@ func NewRedisConfig(name string) *RedisConfig {
 type args struct {
 	redisConfigFile string
 	debug           bool
+	level           string // not implemented yet
 	priority        string
 	tag             string
 }
@@ -184,6 +185,7 @@ const (
 	Debug
 	Unknown
 )
+
 // stats tracks number of unique messages received. Levels are only extracted
 // from JSON messages where object contains field called "level", and that
 // field contains a name known to this utility.
@@ -208,11 +210,11 @@ func (p *Publish) stats() {
 
 			b, _ := json.Marshal(
 				map[string]interface{}{
-				"counts": Counters{
-					Plain: counts[Plain],
-					Json:  counts[Json],
-				},
-				"source": p.source,
+					"counts": Counters{
+						Plain: counts[Plain],
+						Json:  counts[Json],
+					},
+					"source": p.source,
 				},
 			)
 			log.Printf("%s", string(b))
@@ -237,18 +239,18 @@ func dupesNotification(m *Message, td time.Duration) map[string]interface{} {
 	} else {
 		json.Unmarshal(m.data, &dup)
 	}
-	dup["level"] = "INFO"
+	dup["level"] = "info"
 	dup["period"] = td.String()
-	dup["repeated"] = m.count
+	dup["suppressed"] = m.count
 	dup["timestamp"] = time.Now().Format(time.RFC3339Nano)
 	return dup
 }
 
-// periodicDupesProcessing on a regular basis produces an informational entry 
+// periodicDupesProcessing on a regular basis produces an informational entry
 // for each message which was encountered more than once during previous
 // interval.
 func periodicDupesProcessing(p *Publish, dupes *Messages) {
-	const interval = 10
+	const interval = 60
 	var t = p.chans
 	var ticker = time.NewTicker(interval * time.Second)
 	var timestamp = time.Now()
@@ -260,6 +262,7 @@ func periodicDupesProcessing(p *Publish, dupes *Messages) {
 				if v.count > 0 {
 					m := dupesNotification(v, delta)
 					m["source"] = p.source
+					m["key"] = "DuplicateMessageSuppressed"
 					t.json <- m
 				}
 			}
@@ -269,6 +272,8 @@ func periodicDupesProcessing(p *Publish, dupes *Messages) {
 	}
 }
 
+// dispatch is where data from stdin is read, digested, and dispatched to
+// functions which send it to Redis or syslog.
 func dispatch(p *Publish, dupes *Messages) {
 	var t = p.chans
 	var scnr = bufio.NewScanner(os.Stdin)
@@ -281,7 +286,8 @@ func dispatch(p *Publish, dupes *Messages) {
 		// "msg" or "message" field for the purposes of establishing uniqueness
 		// of the message. Because it is a serialized object, which likely
 		// contains continuously variable fields such as a timestamp, we want to
-		// only focus on the actual log text and ignore any associated metadata.
+		// only focus on the actual log text and ignore any associated metadata,
+		// otherwise we won't be able to detect duplicate messages.
 		if validJSON {
 			json.Unmarshal(scnr.Bytes(), &m)
 			if v, ok := getValue("msg", m); ok {
@@ -304,14 +310,20 @@ func dispatch(p *Publish, dupes *Messages) {
 		if !validJSON {
 			log.Println("-> plaintext")
 			t.syslogplaintext <- scnr.Bytes()
-			t.plaintext <- scnr.Bytes()
+			m["key"] = "SyslogMessage"
+			m["level"] = "notice"  // this should come from CLI args
+			m["msg"] = scnr.Text() // may become "message" instead
+			m["source"] = p.source
+			m["timestamp"] = time.Now().Format(time.RFC3339Nano)
+			t.plaintext <- m
 		} else {
-			// var m = make(map[string]interface{})
-			// json.Unmarshal(scnr.Bytes(), &m)
 			// When "source" key does not exist, we use the tag `-t` with which
 			// this program was started.
 			if _, ok := getValue("source", m); !ok {
 				m["source"] = p.source
+			}
+			if _, ok := getValue("key", m); !ok {
+				m["key"] = "SyslogMessage"
 			}
 			t.json <- m
 			t.syslogjson <- m
@@ -329,15 +341,16 @@ func getValue(k string, m map[string]interface{}) (string, bool) {
 
 type topics struct {
 	json            chan map[string]interface{}
-	plaintext       chan []byte
+	plaintext       chan map[string]interface{}
 	syslogjson      chan map[string]interface{}
 	syslogplaintext chan []byte
 }
 
 type Publish struct {
+	conf      *args
 	chans     *topics
 	statsChan chan stat
-	source string
+	source    string
 }
 
 func (p *Publish) Close() {
@@ -348,16 +361,17 @@ func (p *Publish) Close() {
 	close(p.statsChan)
 }
 
-func NewPublish(source string) *Publish {
+func NewPublish(conf *args) *Publish {
 	return &Publish{
+		conf: conf,
 		chans: &topics{
 			json:            make(chan map[string]interface{}),
-			plaintext:       make(chan []byte),
+			plaintext:       make(chan map[string]interface{}),
 			syslogjson:      make(chan map[string]interface{}),
 			syslogplaintext: make(chan []byte),
 		},
 		statsChan: make(chan stat),
-		source: source,
+		source:    conf.tag,
 	}
 }
 
@@ -429,7 +443,8 @@ func (p *Publish) publishToTopic(rdb *redis.Client) {
 			msgEncoded, _ := json.Marshal(msg)
 			rdb.Publish("json_msgs", msgEncoded)
 		case msg := <-p.chans.plaintext:
-			rdb.Publish("plain_msgs", msg)
+			msgEncoded, _ := json.Marshal(msg)
+			rdb.Publish("plain_msgs", msgEncoded)
 		}
 	}
 }
@@ -463,7 +478,7 @@ func main() {
 	}
 
 	// Setup pipelines
-	p := NewPublish(cliArgs.tag)
+	p := NewPublish(&cliArgs)
 
 	// Initialize duplicate messages structure
 	dupes := NewMap()
