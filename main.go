@@ -280,8 +280,9 @@ func dispatch(p *Publish, dupes *Messages) {
 	var t = p.chans
 	var scnr = bufio.NewScanner(os.Stdin)
 	var validJSON bool
+	var content bytes.Buffer
 	for scnr.Scan() {
-		var content bytes.Buffer
+		content.Reset() // Re-using the same buffer instead of re-allocating
 		validJSON = json.Valid(scnr.Bytes())
 		var m = make(map[string]interface{})
 		// When message is a JSON object, we want to use just the contents of
