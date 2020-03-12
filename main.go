@@ -72,6 +72,8 @@ func setupCliFlags() {
 	flag.StringVar(&cliArgs.priority, "p", "daemon.notice", "Priority as 'facility.level' to use when message does not have one already")
 	flag.StringVar(&cliArgs.redisConfigFile, "redis-cfgfile", "redis.json", "Configuration file location with Redis db info")
 	flag.Parse()
+
+	cliArgs.level = "notice" // FIXME: should derive from CLI args
 }
 
 func strToFacility(s string, defaultFacility syslog.Priority) syslog.Priority {
@@ -228,11 +230,11 @@ func (p *Publish) stats() {
 	}
 }
 
-// dupesNotification creates a map which contains the original message body,
+// suppressedToMap creates a map which contains the original message body,
 // and if original was decoded JSON, then only contents of "msg" or "message"
 // field, or entire message if original was not valid JSON, and includes number
 // of times this message occurred over a given period in seconds.
-func dupesNotification(m *Message, td time.Duration) map[string]interface{} {
+func suppressedToMap(m *Message, td time.Duration) map[string]interface{} {
 	var dup = make(map[string]interface{})
 	if !json.Valid(m.data) {
 		dup["message"] = string(m.data)
@@ -242,14 +244,14 @@ func dupesNotification(m *Message, td time.Duration) map[string]interface{} {
 	dup["level"] = "info"
 	dup["period"] = td.String()
 	dup["suppressed"] = m.count
-	dup["timestamp"] = time.Now().Format(time.RFC3339Nano)
+	dup["time"] = time.Now().Format(time.RFC3339Nano)
 	return dup
 }
 
-// periodicDupesProcessing on a regular basis produces an informational entry
+// reportSuppressed on a regular basis produces an informational entry
 // for each message which was encountered more than once during previous
 // interval.
-func periodicDupesProcessing(p *Publish, dupes *Messages) {
+func reportSuppressed(p *Publish, dupes *Messages) {
 	const interval = 60
 	var t = p.chans
 	var ticker = time.NewTicker(interval * time.Second)
@@ -260,9 +262,9 @@ func periodicDupesProcessing(p *Publish, dupes *Messages) {
 			delta := time.Now().Sub(timestamp)
 			for v := range dupes.Iter() {
 				if v.count > 0 {
-					m := dupesNotification(v, delta)
+					m := suppressedToMap(v, delta)
 					m["source"] = p.source
-					m["key"] = "DuplicateMessageSuppressed"
+					m["key"] = "SuppressedMessage"
 					t.json <- m
 				}
 			}
@@ -308,14 +310,16 @@ func dispatch(p *Publish, dupes *Messages) {
 		// If this is valid JSON, publish it to a JSON messages channel, else
 		// it goes to the plaintext channel.
 		if !validJSON {
-			log.Println("-> plaintext")
 			t.syslogplaintext <- scnr.Bytes()
 			m["key"] = "SyslogMessage"
 			m["level"] = "notice"  // this should come from CLI args
 			m["msg"] = scnr.Text() // may become "message" instead
 			m["source"] = p.source
-			m["timestamp"] = time.Now().Format(time.RFC3339Nano)
+			m["time"] = time.Now().Format(time.RFC3339Nano)
 			t.plaintext <- m
+			if p.conf.debug {
+				log.Println("(plaintext): %v", m)
+			}
 		} else {
 			// When "source" key does not exist, we use the tag `-t` with which
 			// this program was started.
@@ -327,7 +331,9 @@ func dispatch(p *Publish, dupes *Messages) {
 			}
 			t.json <- m
 			t.syslogjson <- m
-			log.Println("-> json")
+			if p.conf.debug {
+				log.Println("(json): %v", m)
+			}
 		}
 	}
 }
@@ -346,8 +352,12 @@ type topics struct {
 	syslogplaintext chan []byte
 }
 
+// Publish implements message publishing part of the program. Methods on this
+// struct do the required work in goroutines after having messages dispatched
+// by the dispatch function, which itself sits in a loop and scanning data from
+// stdin.
 type Publish struct {
-	conf      *args
+	conf      *args // arguments from command line
 	chans     *topics
 	statsChan chan stat
 	source    string
@@ -361,6 +371,8 @@ func (p *Publish) Close() {
 	close(p.statsChan)
 }
 
+// NewPublish builds a ready-to-go Publish struct, mostly just sets-up
+// channels and such.
 func NewPublish(conf *args) *Publish {
 	return &Publish{
 		conf: conf,
@@ -386,10 +398,7 @@ func (p *Publish) publishToSyslog(
 	}
 }
 
-func (p *Publish) publishToSyslogJSON(
-	w *syslog.Writer,
-	defaultLevel syslog.Priority,
-) {
+func (p *Publish) publishToSyslogJSON(w *syslog.Writer) {
 	mapLevelToStat := map[string]stat{
 		"crit":    Crit,
 		"err":     Err,
@@ -405,7 +414,8 @@ func (p *Publish) publishToSyslogJSON(
 		var levelStr string
 		var ok bool
 		if levelStr, ok = getValue("level", obj); !ok {
-			levelStr = levelToStr(defaultLevel, "")
+			// levelStr = levelToStr(defaultLevel, "")
+			levelStr = p.conf.level
 			obj["level"] = levelStr
 		}
 		_ = mapLevelToStat
@@ -417,7 +427,7 @@ func (p *Publish) publishToSyslogJSON(
 		// var msg string
 		for _, k := range [...]string{"msg", "message"} {
 			if v, ok := getValue(k, obj); ok {
-				level := strToLevel(levelStr, defaultLevel)
+				level := strToLevel(levelStr, syslog.LOG_NOTICE)
 				fn := loggerfn(level, w)
 				if err := fn(v); err != nil {
 					panic(err)
@@ -486,7 +496,7 @@ func main() {
 	// Start statistics processing goroutine
 	go p.stats()
 	// Start syslog writing goroutine for JSON messages
-	go p.publishToSyslogJSON(sysLog, strToLevel(cliArgs.priority, syslog.LOG_NOTICE))
+	go p.publishToSyslogJSON(sysLog)
 	// Start syslog writing goroutine for plaintext messages
 	go p.publishToSyslog(sysLog)
 	// Start Redis publishing goroutine
@@ -494,7 +504,7 @@ func main() {
 	// Start dispatch goroutine (it feeds the publishing goroutines)
 	go dispatch(p, dupes)
 	// Start duplicate message processing goroutine
-	go periodicDupesProcessing(p, dupes)
+	go reportSuppressed(p, dupes)
 
 	<-doneChan
 	p.Close()
