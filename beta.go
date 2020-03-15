@@ -73,5 +73,6 @@ func (m *Messages) Iter() chan *Message {
 func (m *Messages) Reset() {
 	m.mtx.Lock()
 	defer m.mtx.Unlock()
+	// We actually reset by creating a new map, seems odd, yes...
 	m.cm = make(CounterMap)
 }

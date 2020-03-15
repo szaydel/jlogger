@@ -213,19 +213,34 @@ func (p *Publish) stats() {
 			b, _ := json.Marshal(
 				map[string]interface{}{
 					"counts": Counters{
-						Plain: counts[Plain],
-						Json:  counts[Json],
+						Plain:   counts[Plain],
+						Json:    counts[Json],
+						Crit:    counts[Crit],
+						Err:     counts[Err],
+						Warning: counts[Warning],
+						Notice:  counts[Notice],
+						Info:    counts[Info],
+						Debug:   counts[Debug],
 					},
 					"source": p.source,
 				},
 			)
-			log.Printf("%s", string(b))
+			if p.conf.debug {
+				log.Printf("%s", string(b))
+			}
 			// Reset the counts after proceessing and reporting stats.
 			for i, _ := range counts {
 				counts[i] = 0
 			}
 		case v := <-p.statsChan:
 			counts[v]++
+		case <-p.doneChan:
+			if p.conf.debug {
+				log.Println("Shutting down stats")
+			}
+			p.ackDoneChan <- struct{}{}
+			return
+
 		}
 	}
 }
@@ -263,6 +278,7 @@ func reportSuppressed(p *Publish, dupes *Messages) {
 			for v := range dupes.Iter() {
 				if v.count > 0 {
 					m := suppressedToMap(v, delta)
+					m["suppressed_per_sec"] = float64(m["suppressed"].(uint64)) / delta.Seconds()
 					m["source"] = p.source
 					m["key"] = "SuppressedMessage"
 					t.json <- m
@@ -317,9 +333,10 @@ func dispatch(p *Publish, dupes *Messages) {
 			m["msg"] = scnr.Text() // may become "message" instead
 			m["source"] = p.source
 			m["time"] = time.Now().Format(time.RFC3339Nano)
+			m["plaintext"] = true
 			t.plaintext <- m
 			if p.conf.debug {
-				log.Println("(plaintext): %v", m)
+				log.Printf("(plaintext): %v", m)
 			}
 		} else {
 			// When "source" key does not exist, we use the tag `-t` with which
@@ -333,7 +350,7 @@ func dispatch(p *Publish, dupes *Messages) {
 			t.json <- m
 			t.syslogjson <- m
 			if p.conf.debug {
-				log.Println("(json): %v", m)
+				log.Printf("(json): %v", m)
 			}
 		}
 	}
@@ -358,18 +375,25 @@ type topics struct {
 // by the dispatch function, which itself sits in a loop and scanning data from
 // stdin.
 type Publish struct {
-	conf      *args // arguments from command line
-	chans     *topics
-	statsChan chan stat
-	source    string
+	conf        *args // arguments from command line
+	chans       *topics
+	ackDoneChan chan struct{}
+	doneChan    chan struct{}
+	statsChan   chan stat
+	source      string
 }
 
+// Close shuts down publishers, and should be called before terminating
+// the program.
 func (p *Publish) Close() {
-	close(p.chans.json)
-	close(p.chans.plaintext)
-	close(p.chans.syslogjson)
-	close(p.chans.syslogplaintext)
-	close(p.statsChan)
+	const numOfWorkers = 4
+	close(p.doneChan)
+	// This blocks until all publishers acknowledge and corresponding
+	// goroutines return. We do not close any of the *topics channels to avoid
+	// a write on closed channel in the dispatch(...) goroutine.
+	for i := 0; i < numOfWorkers; i++ {
+		<-p.ackDoneChan
+	}
 }
 
 // NewPublish builds a ready-to-go Publish struct, mostly just sets-up
@@ -383,8 +407,10 @@ func NewPublish(conf *args) *Publish {
 			syslogjson:      make(chan map[string]interface{}),
 			syslogplaintext: make(chan []byte),
 		},
-		statsChan: make(chan stat),
-		source:    conf.tag,
+		ackDoneChan: make(chan struct{}),
+		doneChan:    make(chan struct{}),
+		statsChan:   make(chan stat),
+		source:      conf.tag,
 	}
 }
 
@@ -392,10 +418,19 @@ func (p *Publish) publishToSyslog(
 	w io.Writer,
 ) {
 	for {
-		if _, err := fmt.Fprintf(w, "%s", <-p.chans.syslogplaintext); err != nil {
-			panic(err)
+		select {
+		case msg := <-p.chans.syslogplaintext:
+			if _, err := fmt.Fprintf(w, "%s", msg); err != nil {
+				panic(err)
+			}
+			p.statsChan <- Plain
+		case <-p.doneChan:
+			if p.conf.debug {
+				log.Println("Shutting down publishToSyslog")
+			}
+			p.ackDoneChan <- struct{}{}
+			return
 		}
-		p.statsChan <- Plain
 	}
 }
 
@@ -411,65 +446,79 @@ func (p *Publish) publishToSyslogJSON(w *syslog.Writer) {
 		"debug":   Debug,
 	}
 	for {
-		obj := <-p.chans.syslogjson
-		var levelStr string
-		var ok bool
-		if levelStr, ok = getValue("level", obj); !ok {
-			// levelStr = levelToStr(defaultLevel, "")
-			levelStr = p.conf.level
-			obj["level"] = levelStr
-		}
-		_ = mapLevelToStat
-		p.statsChan <- mapLevelToStat[levelStr]
-		p.statsChan <- Json // This is a JSON-serialized message
-		// Expect that message key could be either "msg" or "message".
-		// If neither is found, or not a string value, we abandon processing
-		// this particular object.
-		// var msg string
-		for _, k := range [...]string{"msg", "message"} {
-			if v, ok := getValue(k, obj); ok {
-				level := strToLevel(levelStr, syslog.LOG_NOTICE)
-				fn := loggerfn(level, w)
-				if err := fn(v); err != nil {
-					panic(err)
-				}
-				break
+		select {
+		case obj := <-p.chans.syslogjson:
+			var levelStr string
+			var ok bool
+			if levelStr, ok = getValue("level", obj); !ok {
+				// levelStr = levelToStr(defaultLevel, "")
+				levelStr = p.conf.level
+				obj["level"] = levelStr
 			}
+			p.statsChan <- mapLevelToStat[strings.ToLower(levelStr)]
+			p.statsChan <- Json // This is a JSON-serialized message
+			// Expect that message key could be either "msg" or "message".
+			// If neither is found, or not a string value, we abandon processing
+			// this particular object.
+			// var msg string
+			for _, k := range [...]string{"msg", "message"} {
+				if v, ok := getValue(k, obj); ok {
+					level := strToLevel(levelStr, syslog.LOG_NOTICE)
+					fn := loggerfn(level, w)
+					if err := fn(v); err != nil {
+						panic(err)
+					}
+					break
+				}
+			}
+		case <-p.doneChan:
+			if p.conf.debug {
+				log.Println("Shutting down publishToSyslogJSON")
+			}
+			p.ackDoneChan <- struct{}{}
+			return
 		}
 	}
 }
 
-func (p *Publish) publishToTopic(rdb *redis.Client) {
-	pubsub1 := rdb.Subscribe("json_msgs")
-	if _, err := pubsub1.Receive(); err != nil {
-		panic(err)
-	}
-	pubsub2 := rdb.Subscribe("plain_msgs")
-	if _, err := pubsub2.Receive(); err != nil {
+type PubSubInterface interface {
+	Publish(channel string, message interface{}) *redis.IntCmd
+	Subscribe(channels ...string) *redis.PubSub
+}
+
+func (p *Publish) publishToDatabase(ps PubSubInterface) {
+	psValidate := ps.Subscribe("json_msgs")
+	if _, err := psValidate.Receive(); err != nil {
 		panic(err)
 	}
 	for {
 		select {
 		case msg := <-p.chans.json:
 			msgEncoded, _ := json.Marshal(msg)
-			rdb.Publish("json_msgs", msgEncoded)
+			ps.Publish("json_msgs", msgEncoded)
 		case msg := <-p.chans.plaintext:
 			msgEncoded, _ := json.Marshal(msg)
-			rdb.Publish("plain_msgs", msgEncoded)
+			ps.Publish("json_msgs", msgEncoded)
+		case <-p.doneChan:
+			if p.conf.debug {
+				log.Println("Shutting down publishToDatabase")
+			}
+			p.ackDoneChan <- struct{}{}
+			return
 		}
 	}
 }
 
-func signalHandler(sig chan os.Signal, done chan bool) {
+func signalHandler(sig chan os.Signal, done chan struct{}) {
 	v := <-sig
 	log.Printf("Shutting down on %v signal", v)
-	done <- true
+	close(done)
 }
 
 func main() {
 	setupCliFlags()
 	sigChan := make(chan os.Signal, 1)
-	doneChan := make(chan bool, 1)
+	doneChan := make(chan struct{})
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	go signalHandler(sigChan, doneChan)
 
@@ -501,7 +550,7 @@ func main() {
 	// Start syslog writing goroutine for plaintext messages
 	go p.publishToSyslog(sysLog)
 	// Start Redis publishing goroutine
-	go p.publishToTopic(rdb)
+	go p.publishToDatabase(rdb)
 	// Start dispatch goroutine (it feeds the publishing goroutines)
 	go dispatch(p, dupes)
 	// Start duplicate message processing goroutine
