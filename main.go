@@ -11,12 +11,40 @@ import (
 	"log/syslog"
 	"os"
 	"os/signal"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/go-redis/redis/v7"
 )
+
+var patterns = struct {
+	debug *regexp.Regexp
+	err   *regexp.Regexp
+	info  *regexp.Regexp
+	warn  *regexp.Regexp
+}{
+	debug: regexp.MustCompile("(?i:debug)"),
+	err:   regexp.MustCompile("(?i:error|fail|fault|crit|panic)"),
+	info:  regexp.MustCompile("(?i:info)"),
+	warn:  regexp.MustCompile("(?i:warn|caution)"),
+}
+
+func detectLevel(b []byte) syslog.Priority {
+	switch {
+	case patterns.err.Match(b):
+		return syslog.LOG_ERR
+	case patterns.warn.Match(b):
+		return syslog.LOG_WARNING
+	case patterns.info.Match(b):
+		return syslog.LOG_INFO
+	case patterns.debug.Match(b):
+		return syslog.LOG_DEBUG
+	default:
+		return syslog.LOG_NOTICE
+	}
+}
 
 // RedisConfig is a struct representing Redis server configuration.
 type RedisConfig struct {
@@ -256,6 +284,7 @@ func suppressedToMap(m *Message, td time.Duration) map[string]interface{} {
 	} else {
 		json.Unmarshal(m.data, &dup)
 	}
+	// Regardless of message content, we consider these to be informational.
 	dup["level"] = "info"
 	dup["period"] = td.String()
 	dup["suppressed"] = m.count
@@ -329,7 +358,7 @@ func dispatch(p *Publish, dupes *Messages) {
 		if !validJSON {
 			t.syslogplaintext <- scnr.Bytes()
 			m["key"] = "SyslogMessage"
-			m["level"] = "notice"  // this should come from CLI args
+			m["level"] = levelToStr(detectLevel(scnr.Bytes()), cliArgs.level)
 			m["msg"] = scnr.Text() // may become "message" instead
 			m["source"] = p.source
 			m["time"] = time.Now().Format(time.RFC3339Nano)
@@ -346,6 +375,10 @@ func dispatch(p *Publish, dupes *Messages) {
 			}
 			if _, ok := getValue("key", m); !ok {
 				m["key"] = "SyslogMessage"
+			}
+			if _, ok := getValue("level", m); !ok {
+				m["level"] = levelToStr(
+					detectLevel(scnr.Bytes()), cliArgs.level)
 			}
 			t.json <- m
 			t.syslogjson <- m
