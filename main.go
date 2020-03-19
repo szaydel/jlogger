@@ -176,11 +176,11 @@ func strToPriority(
 func levelToStr(level syslog.Priority, defaultLevelStr string) string {
 	var mapLevelToStr = map[syslog.Priority]string{
 		syslog.LOG_CRIT:    "fatal",
-		syslog.LOG_ERR:     "err",
+		syslog.LOG_ERR:     "error",
 		syslog.LOG_WARNING: "warning",
 		syslog.LOG_NOTICE:  "notice",
 		syslog.LOG_INFO:    "info",
-		syslog.LOG_DEBUG:   "dbug",
+		syslog.LOG_DEBUG:   "debug",
 	}
 	if levelStr, ok := mapLevelToStr[level]; ok {
 		return levelStr
