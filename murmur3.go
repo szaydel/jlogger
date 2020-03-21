@@ -1,7 +1,14 @@
 package main
 
-// http://code.google.com/p/guava-libraries/source/browse/guava/src/com/google/common/hash/Murmur3_32HashFunction.java
+/*
+ * MurmurHash3 was written by Austin Appleby, and is placed in the public
+ * domain. The author hereby disclaims copyright to this source code.
+ */
 
+/*
+ * Java version based upon which this work was done can be found at:
+ * http://code.google.com/p/guava-libraries/source/browse/guava/src/com/google/common/hash/Murmur3_32HashFunction.java
+*/
 import (
 	"hash"
 	"math/bits"

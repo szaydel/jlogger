@@ -6,20 +6,20 @@ import (
 )
 
 type Message struct {
-	data []byte
+	data  []byte
 	count uint64
 }
 
 type CounterMap map[uint32]*Message
 
 type Messages struct {
-	cm CounterMap
+	cm  CounterMap
 	mtx sync.Mutex
 }
 
 func NewMap() *Messages {
 	m := &Messages{
-		cm: make(CounterMap),
+		cm:  make(CounterMap),
 		mtx: sync.Mutex{},
 	}
 	return m
@@ -64,7 +64,7 @@ func (m *Messages) Iter() chan *Message {
 			c <- v
 		}
 		close(c)
-	return
+		return
 	}()
 	return c
 }
