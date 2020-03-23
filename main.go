@@ -136,7 +136,7 @@ func strToLevel(s string, defaultLevel syslog.Priority) syslog.Priority {
 		"warning": syslog.LOG_WARNING,
 		"notice":  syslog.LOG_NOTICE,
 		"info":    syslog.LOG_INFO,
-		"dbug":    syslog.LOG_DEBUG,
+		"debug":   syslog.LOG_DEBUG,
 	}
 	var levelStr string
 	if strings.Contains(s, ".") {
@@ -156,7 +156,7 @@ func strToPriority(
 	defaultLevel, defaultFacility syslog.Priority,
 ) syslog.Priority {
 	var facility, level syslog.Priority
-	tokens := strings.Split(s, ".")
+	tokens := strings.Split(strings.ToLower(s), ".")
 
 	switch len(tokens) {
 	// We are only extracting level in this case
@@ -207,6 +207,7 @@ type stat uint16
 const (
 	Plain stat = iota
 	Json
+	Duplicate
 	Crit
 	Err
 	Warning
@@ -216,6 +217,13 @@ const (
 	Unknown
 )
 
+func computeRatio(n, d int64) float64 {
+	if n == 0 || d == 0 {
+		return 0.
+	}
+	return float64(n) / float64(d)
+}
+
 // stats tracks number of unique messages received. Levels are only extracted
 // from JSON messages where object contains field called "level", and that
 // field contains a name known to this utility.
@@ -224,31 +232,33 @@ func (p *Publish) stats() {
 	// Counters is meant to be private, but it is "exported" in order to be
 	// JSON-marshal(able). In reality, it is not visible outside of this method.
 	type Counters struct {
-		Plain   int64 `json:"plaintext"`
-		Json    int64 `json:"json_encoded"`
-		Crit    int64 `json:"critical"`
-		Err     int64 `json:"error"`
-		Warning int64 `json:"warning"`
-		Notice  int64 `json:"notice"`
-		Info    int64 `json:"info"`
-		Debug   int64 `json:"debug"`
+		Plain     int64 `json:"plaintext"`
+		Json      int64 `json:"json_encoded"`
+		Duplicate int64 `json:"duplicate"`
+		Crit      int64 `json:"critical"`
+		Err       int64 `json:"error"`
+		Warning   int64 `json:"warning"`
+		Notice    int64 `json:"notice"`
+		Info      int64 `json:"info"`
+		Debug     int64 `json:"debug"`
 	}
 	var counts [Unknown]int64
+	var t = time.NewTicker(interval * time.Second).C
 	for {
 		select {
-		case <-time.Tick(interval * time.Second):
-
+		case <-t:
 			b, _ := json.Marshal(
 				map[string]interface{}{
 					"counts": Counters{
-						Plain:   counts[Plain],
-						Json:    counts[Json],
-						Crit:    counts[Crit],
-						Err:     counts[Err],
-						Warning: counts[Warning],
-						Notice:  counts[Notice],
-						Info:    counts[Info],
-						Debug:   counts[Debug],
+						Plain:     counts[Plain],
+						Json:      counts[Json],
+						Duplicate: counts[Duplicate],
+						Crit:      counts[Crit],
+						Err:       counts[Err],
+						Warning:   counts[Warning],
+						Notice:    counts[Notice],
+						Info:      counts[Info],
+						Debug:     counts[Debug],
 					},
 					"source": p.source,
 				},
@@ -288,6 +298,11 @@ func suppressedToMap(m *Message, td time.Duration) map[string]interface{} {
 	dup["level"] = "info"
 	dup["period"] = td.String()
 	dup["suppressed"] = m.count
+	if (time.Duration(m.count) * time.Second / td) > 1 {
+		dup["alert"] = true
+	} else {
+		dup["alert"] = false
+	}
 	dup["time"] = time.Now().Format(time.RFC3339Nano)
 	return dup
 }
@@ -350,6 +365,7 @@ func dispatch(p *Publish, dupes *Messages) {
 		}
 
 		if !dupes.Insert(content.Bytes()) {
+			p.statsChan <- Duplicate
 			continue
 		}
 
@@ -358,7 +374,13 @@ func dispatch(p *Publish, dupes *Messages) {
 		if !validJSON {
 			t.syslogplaintext <- scnr.Bytes()
 			m["key"] = "SyslogMessage"
-			m["level"] = levelToStr(detectLevel(scnr.Bytes()), cliArgs.level)
+			level := detectLevel(scnr.Bytes())
+			m["level"] = levelToStr(level, cliArgs.level)
+			if level < syslog.LOG_DEBUG {
+				m["ccs"] = true
+			} else {
+				m["ccs"] = false
+			}
 			m["msg"] = scnr.Text() // may become "message" instead
 			m["source"] = p.source
 			m["time"] = time.Now().Format(time.RFC3339Nano)
@@ -373,13 +395,40 @@ func dispatch(p *Publish, dupes *Messages) {
 			if _, ok := getValue("source", m); !ok {
 				m["source"] = p.source
 			}
+			// Fallback to generic key, which we have been using historically
+			// in this context.
 			if _, ok := getValue("key", m); !ok {
 				m["key"] = "SyslogMessage"
 			}
-			if _, ok := getValue("level", m); !ok {
-				m["level"] = levelToStr(
-					detectLevel(scnr.Bytes()), cliArgs.level)
+			// We attempt to derive level from the data if we don't already
+			// have it in this map.
+			var level syslog.Priority
+			if levelStr, ok := getValue("level", m); !ok {
+				level = detectLevel(scnr.Bytes())
+				m["level"] = levelToStr(level, p.conf.level)
+			} else {
+				level = strToPriority(
+					levelStr, syslog.LOG_NOTICE, 0)
 			}
+
+			// If there is no ccs field, we add it, and set it to true if level
+			// is above syslog.LOG_DEBUG. Historically our model has been to
+			// send messages to CCS as long as they were not debug messages or
+			// explicitly identified as being local-only.
+			if _, ok := getValue("ccs", m); !ok {
+				if level < syslog.LOG_DEBUG {
+					m["ccs"] = true
+				} else {
+					m["ccs"] = false
+				}
+			}
+			// If the map already has a time field, i.e. original JSON object
+			// had a time field, we will add a new field called source_time,
+			// and add a time field with value of time.Now().
+			if v, ok := getValue("time", m); ok {
+				m["source_time"] = v
+			}
+			m["time"] = time.Now().Format(time.RFC3339Nano)
 			t.json <- m
 			t.syslogjson <- m
 			if p.conf.debug {
