@@ -225,6 +225,24 @@ const (
 	Unknown
 )
 
+func levelToStat(levelStr string) stat {
+	mapLevelToStat := map[string]stat{
+		"crit":    Crit,
+		"err":     Err,
+		"error":   Err,
+		"warn":    Warning,
+		"warning": Warning,
+		"notice":  Notice,
+		"info":    Info,
+		"debug":   Debug,
+	}
+	if v, ok := mapLevelToStat[levelStr]; !ok {
+		return Unknown
+	} else {
+		return v
+	}
+}
+
 func computeRatio(n, d int64) float64 {
 	if n == 0 || d == 0 {
 		return 0.
@@ -397,7 +415,6 @@ func dispatch(p *Publish, dupes *Messages) {
 				if p.conf.debug {
 					log.Println("dropped plaintext message after timeout")
 				}
-				continue
 			}
 
 			if p.conf.debug {
@@ -461,6 +478,14 @@ func dispatch(p *Publish, dupes *Messages) {
 			}
 			if p.conf.debug {
 				log.Printf("(json): %v", m)
+			}
+		}
+		// Bump stats, tracking count of messages by level.
+		select {
+		case p.statsChan <- levelToStat(m["level"].(string)):
+		case <-time.After(ChanTimeout):
+			if p.conf.debug {
+				log.Println("dropped stat after timeout")
 			}
 		}
 	}
@@ -644,7 +669,6 @@ func (p *Publish) publishToSyslogJSON(w *syslog.Writer) {
 				obj["level"] = levelStr
 			}
 			log.Printf("(2) level[%d] => %s", mapLevelToStat[strings.ToLower(levelStr)], strings.ToLower(levelStr))
-			p.statsChan <- mapLevelToStat[strings.ToLower(levelStr)]
 			p.statsChan <- Json // This is a JSON-serialized message
 			// Expect that message key could be either "msg" or "message".
 			// If neither is found, or not a string value, we abandon processing
