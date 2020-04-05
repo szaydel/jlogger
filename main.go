@@ -19,6 +19,12 @@ import (
 	"github.com/go-redis/redis/v7"
 )
 
+const (
+	// ChanTimeout is the amount of time we allow to wait on channel writes
+	// before dropping the message.
+	ChanTimeout = 100 * time.Millisecond
+)
+
 var patterns = struct {
 	debug *regexp.Regexp
 	err   *regexp.Regexp
@@ -88,6 +94,7 @@ type args struct {
 	redisConfigFile string
 	debug           bool
 	level           string // not implemented yet
+	parserPattern   string
 	priority        string
 	tag             string
 }
@@ -97,6 +104,7 @@ var cliArgs args
 func setupCliFlags() {
 	flag.BoolVar(&cliArgs.debug, "debug", false, "Enable debugging")
 	flag.StringVar(&cliArgs.tag, "t", "demotag", "Tag with which to publish messages")
+	flag.StringVar(&cliArgs.parserPattern, "pattern", "", "Pattern containing minimally a <msg> capture group")
 	flag.StringVar(&cliArgs.priority, "p", "daemon.notice", "Priority as 'facility.level' to use when message does not have one already")
 	flag.StringVar(&cliArgs.redisConfigFile, "redis-cfgfile", "redis.json", "Configuration file location with Redis db info")
 	flag.Parse()
@@ -278,7 +286,6 @@ func (p *Publish) stats() {
 			}
 			p.ackDoneChan <- struct{}{}
 			return
-
 		}
 	}
 }
@@ -325,7 +332,11 @@ func reportSuppressed(p *Publish, dupes *Messages) {
 					m["suppressed_per_sec"] = float64(m["suppressed"].(uint64)) / delta.Seconds()
 					m["source"] = p.source
 					m["key"] = "SuppressedMessage"
-					t.json <- m
+					select {
+					case t.json <- m:
+					case <-time.After(ChanTimeout):
+						log.Println("dropped suppressed report")
+					}
 				}
 			}
 			dupes.Reset()
@@ -371,25 +382,28 @@ func dispatch(p *Publish, dupes *Messages) {
 
 		// If this is valid JSON, publish it to a JSON messages channel, else
 		// it goes to the plaintext channel.
-		if !validJSON {
-			t.syslogplaintext <- scnr.Bytes()
-			m["key"] = "SyslogMessage"
-			level := detectLevel(scnr.Bytes())
-			m["level"] = levelToStr(level, cliArgs.level)
-			if level < syslog.LOG_DEBUG {
-				m["ccs"] = true
-			} else {
-				m["ccs"] = false
+		if !validJSON { // Invalid JSON extracted from stdin
+			select {
+			// Write message as-is without any transformations to syslog.
+			case t.syslogplaintext <- scnr.Bytes():
+			case <-time.After(ChanTimeout):
+				log.Println("dropped plaintext message after timeout")
 			}
-			m["msg"] = scnr.Text() // may become "message" instead
-			m["source"] = p.source
-			m["time"] = time.Now().Format(time.RFC3339Nano)
-			m["plaintext"] = true
-			t.plaintext <- m
+			m = p.transform.MsgToMap(scnr)
+			select {
+			case t.json <- m:
+			case <-time.After(ChanTimeout):
+				// dropping this message instead of blocking here
+				if p.conf.debug {
+					log.Println("dropped plaintext message after timeout")
+				}
+				continue
+			}
+
 			if p.conf.debug {
 				log.Printf("(plaintext): %v", m)
 			}
-		} else {
+		} else { // Valid JSON extracted from stdin
 			// When "source" key does not exist, we use the tag `-t` with which
 			// this program was started.
 			if _, ok := getValue("source", m); !ok {
@@ -429,13 +443,96 @@ func dispatch(p *Publish, dupes *Messages) {
 				m["source_time"] = v
 			}
 			m["time"] = time.Now().Format(time.RFC3339Nano)
-			t.json <- m
-			t.syslogjson <- m
+			select {
+			case t.json <- m:
+				log.Printf("(1-1) %v", m)
+			case <-time.After(ChanTimeout):
+				if p.conf.debug {
+					log.Println("dropped JSON->redis message after timeout")
+				}
+			}
+			select {
+			case t.syslogjson <- m:
+				log.Printf("(1-2) %v", m)
+			case <-time.After(ChanTimeout):
+				if p.conf.debug {
+					log.Println("dropped JSON->redis message after timeout")
+				}
+			}
 			if p.conf.debug {
 				log.Printf("(json): %v", m)
 			}
 		}
 	}
+}
+
+type Transformer interface {
+	MsgToMap(scnr *bufio.Scanner) map[string]interface{}
+}
+
+type Parser struct {
+	conf         *args
+	parserRegexp *regexp.Regexp
+}
+
+func (p *Parser) mustParse() bool {
+	return p.parserRegexp != nil
+}
+
+func (p *Parser) MsgToMap(scnr *bufio.Scanner) map[string]interface{} {
+	m := make(map[string]interface{})
+	if p.mustParse() {
+		results, ok := p.parse(scnr.Bytes())
+		if ok {
+			for k, v := range results {
+				m[k] = v
+			}
+		}
+	}
+	// If after parsing the message we still do not have a `message` field, we
+	// use the entire line as message instead. This is a fallback really.
+	if _, ok := m["message"]; !ok {
+		m["message"] = scnr.Text() // may become "message" instead
+	}
+	if _, ok := m["key"]; !ok {
+		m["key"] = "SyslogMessage"
+	}
+	var level syslog.Priority
+	if _, ok := m["level"]; !ok {
+		level = detectLevel(scnr.Bytes())
+		m["level"] = levelToStr(level, p.conf.level)
+	}
+	if level < syslog.LOG_DEBUG {
+		m["ccs"] = true
+	} else {
+		m["ccs"] = false
+	}
+	m["source"] = p.conf.tag
+	m["time"] = time.Now().Format(time.RFC3339Nano)
+	m["plaintext"] = true
+	return m
+}
+
+func (p *Parser) parse(b []byte) (map[string]string, bool) {
+	results := p.parserRegexp.FindAllSubmatch(b, -1)
+	// if p.conf.debug {
+	// 	for i, level1 := range results[0] {
+	// 		log.Printf("level1: (%d): %s\t=> %s",
+	// 		i, p.parserRegexp.SubexpNames()[i], level1)
+	// 	}
+	// }
+	if len(results) == 0 {
+		return nil, false
+	}
+	m := make(map[string]string, len(results[0])-1)
+	for i, value := range results[0] {
+		if i == 0 { // 0th index contains full string
+			continue
+		}
+		key := p.parserRegexp.SubexpNames()[i]
+		m[key] = string(value)
+	}
+	return m, true
 }
 
 func getValue(k string, m map[string]interface{}) (string, bool) {
@@ -463,6 +560,7 @@ type Publish struct {
 	doneChan    chan struct{}
 	statsChan   chan stat
 	source      string
+	transform   Transformer
 }
 
 // Close shuts down publishers, and should be called before terminating
@@ -481,18 +579,26 @@ func (p *Publish) Close() {
 // NewPublish builds a ready-to-go Publish struct, mostly just sets-up
 // channels and such.
 func NewPublish(conf *args) *Publish {
+	var compiled *regexp.Regexp
+	if conf.parserPattern != "" {
+		compiled = regexp.MustCompile(conf.parserPattern)
+	}
 	return &Publish{
 		conf: conf,
 		chans: &topics{
-			json:            make(chan map[string]interface{}),
-			plaintext:       make(chan map[string]interface{}),
-			syslogjson:      make(chan map[string]interface{}),
-			syslogplaintext: make(chan []byte),
+			json:            make(chan map[string]interface{}, 10),
+			plaintext:       make(chan map[string]interface{}, 10),
+			syslogjson:      make(chan map[string]interface{}, 10),
+			syslogplaintext: make(chan []byte, 10),
 		},
 		ackDoneChan: make(chan struct{}),
 		doneChan:    make(chan struct{}),
 		statsChan:   make(chan stat),
 		source:      conf.tag,
+		transform: &Parser{
+			conf:         conf,
+			parserRegexp: compiled,
+		},
 	}
 }
 
@@ -537,6 +643,7 @@ func (p *Publish) publishToSyslogJSON(w *syslog.Writer) {
 				levelStr = p.conf.level
 				obj["level"] = levelStr
 			}
+			log.Printf("(2) level[%d] => %s", mapLevelToStat[strings.ToLower(levelStr)], strings.ToLower(levelStr))
 			p.statsChan <- mapLevelToStat[strings.ToLower(levelStr)]
 			p.statsChan <- Json // This is a JSON-serialized message
 			// Expect that message key could be either "msg" or "message".
@@ -571,14 +678,11 @@ type PubSubInterface interface {
 func (p *Publish) publishToDatabase(ps PubSubInterface) {
 	psValidate := ps.Subscribe("json_msgs")
 	if _, err := psValidate.Receive(); err != nil {
-		panic(err)
+		log.Panicf("%v", err)
 	}
 	for {
 		select {
 		case msg := <-p.chans.json:
-			msgEncoded, _ := json.Marshal(msg)
-			ps.Publish("json_msgs", msgEncoded)
-		case msg := <-p.chans.plaintext:
 			msgEncoded, _ := json.Marshal(msg)
 			ps.Publish("json_msgs", msgEncoded)
 		case <-p.doneChan:
