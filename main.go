@@ -648,16 +648,6 @@ func (p *Publish) publishToSyslog(
 }
 
 func (p *Publish) publishToSyslogJSON(w *syslog.Writer) {
-	mapLevelToStat := map[string]stat{
-		"crit":    Crit,
-		"err":     Err,
-		"error":   Err,
-		"warn":    Warning,
-		"warning": Warning,
-		"notice":  Notice,
-		"info":    Info,
-		"debug":   Debug,
-	}
 	for {
 		select {
 		case obj := <-p.chans.syslogjson:
@@ -668,7 +658,6 @@ func (p *Publish) publishToSyslogJSON(w *syslog.Writer) {
 				levelStr = p.conf.level
 				obj["level"] = levelStr
 			}
-			log.Printf("(2) level[%d] => %s", mapLevelToStat[strings.ToLower(levelStr)], strings.ToLower(levelStr))
 			p.statsChan <- Json // This is a JSON-serialized message
 			// Expect that message key could be either "msg" or "message".
 			// If neither is found, or not a string value, we abandon processing
