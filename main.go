@@ -297,7 +297,9 @@ func (p *Publish) stats() {
 				counts[i] = 0
 			}
 		case v := <-p.statsChan:
-			counts[v]++
+			if v < Unknown {
+				counts[v]++
+			}
 		case <-p.doneChan:
 			if p.conf.debug {
 				log.Println("Shutting down stats")
