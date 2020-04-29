@@ -23,6 +23,11 @@ const (
 	// ChanTimeout is the amount of time we allow to wait on channel writes
 	// before dropping the message.
 	ChanTimeout = 100 * time.Millisecond
+	// ChanBufferLen is the number of messages which we can queue up in the
+	// channels before the channel (queue) is full. The larger the buffer the
+	// longer messages are retained in the situation where destination is not
+	// reachable.
+	ChanBufferLen = 10
 )
 
 var patterns = struct {
@@ -66,7 +71,7 @@ func (rc *RedisConfig) Addr() string {
 }
 
 // ToRedisOptions builds a *redis.Options struct for convenient interaction
-// with redis client.
+// with Redis client.
 func (rc *RedisConfig) ToRedisOptions() *redis.Options {
 	return &redis.Options{
 		Addr:     rc.Addr(),
@@ -196,6 +201,7 @@ func levelToStr(level syslog.Priority, defaultLevelStr string) string {
 	return defaultLevelStr
 }
 
+// SyslogFunc is a function prototype for a function returned from loggerfn.
 type SyslogFunc func(string) error
 
 func loggerfn(level syslog.Priority, w *syslog.Writer) SyslogFunc {
@@ -407,7 +413,10 @@ func dispatch(p *Publish, dupes *Messages) {
 			// Write message as-is without any transformations to syslog.
 			case t.syslogplaintext <- scnr.Bytes():
 			case <-time.After(ChanTimeout):
-				log.Println("dropped plaintext message after timeout")
+				// dropping this message instead of blocking here
+				if p.conf.debug {
+					log.Printf("dropped plaintext->syslog message after %v timeout", ChanTimeout)
+				}
 			}
 			m = p.transform.MsgToMap(scnr)
 			select {
@@ -415,7 +424,7 @@ func dispatch(p *Publish, dupes *Messages) {
 			case <-time.After(ChanTimeout):
 				// dropping this message instead of blocking here
 				if p.conf.debug {
-					log.Println("dropped plaintext message after timeout")
+					log.Printf("dropped plaintext->redis message after %v timeout", ChanTimeout)
 				}
 			}
 
@@ -613,10 +622,10 @@ func NewPublish(conf *args) *Publish {
 	return &Publish{
 		conf: conf,
 		chans: &topics{
-			json:            make(chan map[string]interface{}, 10),
-			plaintext:       make(chan map[string]interface{}, 10),
-			syslogjson:      make(chan map[string]interface{}, 10),
-			syslogplaintext: make(chan []byte, 10),
+			json:            make(chan map[string]interface{}, ChanBufferLen),
+			syslogjson:      make(chan map[string]interface{}, ChanBufferLen),
+			plaintext:       make(chan map[string]interface{}, ChanBufferLen),
+			syslogplaintext: make(chan []byte, ChanBufferLen),
 		},
 		ackDoneChan: make(chan struct{}),
 		doneChan:    make(chan struct{}),
@@ -636,7 +645,8 @@ func (p *Publish) publishToSyslog(
 		select {
 		case msg := <-p.chans.syslogplaintext:
 			if _, err := fmt.Fprintf(w, "%s", msg); err != nil {
-				panic(err)
+				//panic(err)
+				log.Printf("syslog failed: %v", err)
 			}
 			p.statsChan <- Plain
 		case <-p.doneChan:
@@ -692,9 +702,34 @@ type PubSubInterface interface {
 
 func (p *Publish) publishToDatabase(ps PubSubInterface) {
 	psValidate := ps.Subscribe("json_msgs")
-	if _, err := psValidate.Receive(); err != nil {
-		log.Panicf("%v", err)
+	var connected bool
+	var delay time.Duration = 1 * time.Second
+	// Retry connecting to Redis indefinitely. Upon connection the library
+	// will take over and help to reconnect and re-subscribe as necessary.
+	for !connected {
+		select {
+		case <-p.doneChan:
+			if p.conf.debug {
+				log.Println("Shutting down publishToDatabase")
+			}
+			p.ackDoneChan <- struct{}{}
+			return
+		default:
+			if _, err := psValidate.Receive(); err != nil {
+				log.Println(err)
+				time.Sleep(delay)
+				if delay < 30 * time.Second {
+					delay += (delay/2 + 1)
+				}
+				if p.conf.debug {
+					log.Printf("Delaying reconnect by %v", delay)
+				}
+			} else {
+				connected = true
+			}
+		}
 	}
+
 	for {
 		select {
 		case msg := <-p.chans.json:
