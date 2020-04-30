@@ -98,6 +98,7 @@ func NewRedisConfig(name string) *RedisConfig {
 type args struct {
 	redisConfigFile string
 	debug           bool
+	chanBufLen      int
 	level           string // not implemented yet
 	parserPattern   string
 	priority        string
@@ -107,11 +108,12 @@ type args struct {
 var cliArgs args
 
 func setupCliFlags() {
+	flag.IntVar(&cliArgs.chanBufLen, "channel.buffer.length", ChanBufferLen, "How many messages to allow in the buffer before discards may happen")
 	flag.BoolVar(&cliArgs.debug, "debug", false, "Enable debugging")
 	flag.StringVar(&cliArgs.tag, "t", "demotag", "Tag with which to publish messages")
 	flag.StringVar(&cliArgs.parserPattern, "pattern", "", "Pattern containing minimally a <msg> capture group")
 	flag.StringVar(&cliArgs.priority, "p", "daemon.notice", "Priority as 'facility.level' to use when message does not have one already")
-	flag.StringVar(&cliArgs.redisConfigFile, "redis-cfgfile", "redis.json", "Configuration file location with Redis db info")
+	flag.StringVar(&cliArgs.redisConfigFile, "redis.config.file", "redis.json", "Configuration file location with Redis db info")
 	flag.Parse()
 
 	cliArgs.level = "notice" // FIXME: should derive from CLI args
@@ -389,6 +391,7 @@ func dispatch(p *Publish, dupes *Messages) {
 		// only focus on the actual log text and ignore any associated metadata,
 		// otherwise we won't be able to detect duplicate messages.
 		if validJSON {
+			p.statsChan <- Json
 			json.Unmarshal(scnr.Bytes(), &m)
 			if v, ok := getValue("msg", m); ok {
 				content.WriteString(v)
@@ -398,6 +401,7 @@ func dispatch(p *Publish, dupes *Messages) {
 				continue
 			}
 		} else {
+			p.statsChan <- Plain
 			content.Write(scnr.Bytes())
 		}
 
@@ -622,10 +626,10 @@ func NewPublish(conf *args) *Publish {
 	return &Publish{
 		conf: conf,
 		chans: &topics{
-			json:            make(chan map[string]interface{}, ChanBufferLen),
-			syslogjson:      make(chan map[string]interface{}, ChanBufferLen),
-			plaintext:       make(chan map[string]interface{}, ChanBufferLen),
-			syslogplaintext: make(chan []byte, ChanBufferLen),
+			json:            make(chan map[string]interface{}, conf.chanBufLen),
+			syslogjson:      make(chan map[string]interface{}, conf.chanBufLen),
+			plaintext:       make(chan map[string]interface{}, conf.chanBufLen),
+			syslogplaintext: make(chan []byte, conf.chanBufLen),
 		},
 		ackDoneChan: make(chan struct{}),
 		doneChan:    make(chan struct{}),
@@ -645,10 +649,8 @@ func (p *Publish) publishToSyslog(
 		select {
 		case msg := <-p.chans.syslogplaintext:
 			if _, err := fmt.Fprintf(w, "%s", msg); err != nil {
-				//panic(err)
 				log.Printf("syslog failed: %v", err)
 			}
-			p.statsChan <- Plain
 		case <-p.doneChan:
 			if p.conf.debug {
 				log.Println("Shutting down publishToSyslog")
@@ -670,7 +672,6 @@ func (p *Publish) publishToSyslogJSON(w *syslog.Writer) {
 				levelStr = p.conf.level
 				obj["level"] = levelStr
 			}
-			p.statsChan <- Json // This is a JSON-serialized message
 			// Expect that message key could be either "msg" or "message".
 			// If neither is found, or not a string value, we abandon processing
 			// this particular object.
@@ -716,7 +717,7 @@ func (p *Publish) publishToDatabase(ps PubSubInterface) {
 			return
 		default:
 			if _, err := psValidate.Receive(); err != nil {
-				log.Println(err)
+				log.Printf("Redis error %v", err)
 				time.Sleep(delay)
 				if delay < 30 * time.Second {
 					delay += (delay/2 + 1)
