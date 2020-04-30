@@ -477,7 +477,10 @@ func dispatch(p *Publish, dupes *Messages) {
 			m["time"] = time.Now().Format(time.RFC3339Nano)
 			select {
 			case t.json <- m:
-				log.Printf("(1-1) %v", m)
+				if p.conf.debug {
+					log.Printf("JSON->redis: %v", m)
+				}
+
 			case <-time.After(ChanTimeout):
 				if p.conf.debug {
 					log.Println("dropped JSON->redis message after timeout")
@@ -485,14 +488,13 @@ func dispatch(p *Publish, dupes *Messages) {
 			}
 			select {
 			case t.syslogjson <- m:
-				log.Printf("(1-2) %v", m)
+				if p.conf.debug {
+					log.Printf("JSON->syslog: %v", m)
+				}
 			case <-time.After(ChanTimeout):
 				if p.conf.debug {
 					log.Println("dropped JSON->redis message after timeout")
 				}
-			}
-			if p.conf.debug {
-				log.Printf("(json): %v", m)
 			}
 		}
 		// Bump stats, tracking count of messages by level.
@@ -719,7 +721,7 @@ func (p *Publish) publishToDatabase(ps PubSubInterface) {
 			if _, err := psValidate.Receive(); err != nil {
 				log.Printf("Redis error %v", err)
 				time.Sleep(delay)
-				if delay < 30 * time.Second {
+				if delay < 30*time.Second {
 					delay += (delay/2 + 1)
 				}
 				if p.conf.debug {
