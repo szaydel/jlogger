@@ -8,7 +8,7 @@ package main
 /*
  * Java version based upon which this work was done can be found at:
  * http://code.google.com/p/guava-libraries/source/browse/guava/src/com/google/common/hash/Murmur3_32HashFunction.java
-*/
+ */
 import (
 	"hash"
 	"math/bits"
