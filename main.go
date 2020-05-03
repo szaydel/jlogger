@@ -28,9 +28,18 @@ const (
 	// longer messages are retained in the situation where destination is not
 	// reachable.
 	ChanBufferLen = 10
+
+	// DefaultParserPattern should match any key=value sub-strings if there are
+	// any in the tail of the message.
+	// In other words if message is:
+	// "read failed function=alpha key=NotReadable", then the matched pairs
+	// will be function=alpha and key=NotReadable.
+	DefaultParserPattern = `(?m)(?P<message>^.*)\s\s|(?P<labels>\w+=\w+)`
+
+	DefaultKey = "SyslogMessage"
 )
 
-var patterns = struct {
+var levelsRegexp = struct {
 	debug *regexp.Regexp
 	err   *regexp.Regexp
 	info  *regexp.Regexp
@@ -44,13 +53,13 @@ var patterns = struct {
 
 func detectLevel(b []byte) syslog.Priority {
 	switch {
-	case patterns.err.Match(b):
+	case levelsRegexp.err.Match(b):
 		return syslog.LOG_ERR
-	case patterns.warn.Match(b):
+	case levelsRegexp.warn.Match(b):
 		return syslog.LOG_WARNING
-	case patterns.info.Match(b):
+	case levelsRegexp.info.Match(b):
 		return syslog.LOG_INFO
-	case patterns.debug.Match(b):
+	case levelsRegexp.debug.Match(b):
 		return syslog.LOG_DEBUG
 	default:
 		return syslog.LOG_NOTICE
@@ -99,6 +108,7 @@ type args struct {
 	redisConfigFile string
 	debug           bool
 	chanBufLen      int
+	key             string
 	level           string // not implemented yet
 	parserPattern   string
 	priority        string
@@ -110,8 +120,9 @@ var cliArgs args
 func setupCliFlags() {
 	flag.IntVar(&cliArgs.chanBufLen, "channel.buffer.length", ChanBufferLen, "How many messages to allow in the buffer before discards may happen")
 	flag.BoolVar(&cliArgs.debug, "debug", false, "Enable debugging")
+	flag.StringVar(&cliArgs.key, "key", DefaultKey, "Key with which to publish messages")
 	flag.StringVar(&cliArgs.tag, "t", "demotag", "Tag with which to publish messages")
-	flag.StringVar(&cliArgs.parserPattern, "pattern", "", "Pattern containing minimally a <msg> capture group")
+	flag.StringVar(&cliArgs.parserPattern, "pattern", DefaultParserPattern, "Pattern containing minimally a <msg> capture group")
 	flag.StringVar(&cliArgs.priority, "p", "daemon.notice", "Priority as 'facility.level' to use when message does not have one already")
 	flag.StringVar(&cliArgs.redisConfigFile, "redis.config.file", "redis.json", "Configuration file location with Redis db info")
 	flag.Parse()
@@ -517,16 +528,60 @@ type Parser struct {
 	parserRegexp *regexp.Regexp
 }
 
-func (p *Parser) mustParse() bool {
-	return p.parserRegexp != nil
+// IsBoolType detects if a given string should be treated as a boolean value.
+// It uses struct{}(s) as values in the map because they don't use any memory
+// and we don't actually care for contents of the values in this case, just that
+// we can perform Θ(1) lookups with an input string.
+func IsBoolType(s string) bool {
+	var m = map[string]struct{}{
+		"true":  struct{}{},
+		"True":  struct{}{},
+		"TRUE":  struct{}{},
+		"false": struct{}{},
+		"False": struct{}{},
+		"FALSE": struct{}{},
+		"yes":   struct{}{},
+		"Yes":   struct{}{},
+		"YES":   struct{}{},
+		"no":    struct{}{},
+		"No":    struct{}{},
+		"NO":    struct{}{},
+	}
+	_, ok := m[s]
+	return ok
+}
+
+// StringToBool returns a boolean value for a given string. It assumes that a
+// string which it received via argument `s` is going to exist in the map.
+// There is no checking performed as an optimization. IsBoolType must be used
+// first to make sure that a given string is in fact something we recognize
+// semantically as a boolean value.
+func StringToBool(s string) bool {
+	var m = map[string]bool{
+		"true":  true,
+		"True":  true,
+		"TRUE":  true,
+		"false": false,
+		"False": false,
+		"FALSE": false,
+		"yes":   true,
+		"Yes":   true,
+		"YES":   true,
+		"no":    false,
+		"No":    false,
+		"NO":    false,
+	}
+	return m[s]
 }
 
 func (p *Parser) MsgToMap(scnr *bufio.Scanner) map[string]interface{} {
 	m := make(map[string]interface{})
-	if p.mustParse() {
-		results, ok := p.parse(scnr.Bytes())
-		if ok {
-			for k, v := range results {
+	results, ok := p.parse(scnr.Bytes())
+	if ok {
+		for k, v := range results {
+			if IsBoolType(v) {
+				m[k] = StringToBool(v)
+			} else {
 				m[k] = v
 			}
 		}
@@ -537,7 +592,7 @@ func (p *Parser) MsgToMap(scnr *bufio.Scanner) map[string]interface{} {
 		m["message"] = scnr.Text() // may become "message" instead
 	}
 	if _, ok := m["key"]; !ok {
-		m["key"] = "SyslogMessage"
+		m["key"] = p.conf.key
 	}
 	var level syslog.Priority
 	if _, ok := m["level"]; !ok {
@@ -557,15 +612,29 @@ func (p *Parser) MsgToMap(scnr *bufio.Scanner) map[string]interface{} {
 
 func (p *Parser) parse(b []byte) (map[string]string, bool) {
 	results := p.parserRegexp.FindAllSubmatch(b, -1)
-	// if p.conf.debug {
-	// 	for i, level1 := range results[0] {
-	// 		log.Printf("level1: (%d): %s\t=> %s",
-	// 		i, p.parserRegexp.SubexpNames()[i], level1)
-	// 	}
-	// }
 	if len(results) == 0 {
+		if p.conf.debug {
+			log.Printf("Regexp produced no matches for: '%s'", string(b))
+		}
 		return nil, false
 	}
+
+	// Our base case is to use the default pattern, which should make it
+	// possible to extract any additional labels which follow the message
+	// string. If there are no such labels, the entire string is treated as a
+	// message instead.
+	if p.conf.parserPattern == DefaultParserPattern {
+		return p.defaultRegexpMatchesToMap(results)
+	}
+
+	// Here we are making the assumption that a regex pattern has been provided
+	// as an argument to this program, and it contains one or more named capture
+	// groups, one of which extracts the message and is called `message` and 
+	// others, if there are any, are going to be any additional labels, such as 
+	// the level of this message, or any other "tags" that we want to include 
+	// with this message.
+	// Names of each capture group will become the keys, and correspond to 
+	// values which they are supposed to extract from the message.
 	m := make(map[string]string, len(results[0])-1)
 	for i, value := range results[0] {
 		if i == 0 { // 0th index contains full string
@@ -575,6 +644,50 @@ func (p *Parser) parse(b []byte) (map[string]string, bool) {
 		m[key] = string(value)
 	}
 	return m, true
+}
+
+// defaultRegexpMatchesToMap handles the default Regular Expression pattern,
+// which assumes a plaintext message with one or more key=value pairs after the
+// actual message. Notice, key=value pairs are only matched if there is a
+// leading double-space `\s\s` after the actual message string, as in this 
+// example:
+// `Important thingy failed  level=error function=thingyAlpha`.
+func (p *Parser) defaultRegexpMatchesToMap(results [][][]byte) (map[string]string, bool) {
+	if p.conf.debug {
+		for i, outter := range results {
+			for j, inner := range outter {
+				log.Printf("results[%d][%d] => %s", i, j, string(inner))
+			}
+		}
+	}
+
+	m := make(map[string]string, len(results[0]))
+	m["message"] = strings.TrimRight(string(results[0][0]), " ")
+	var tuple *KeyValueTuple
+	for i := 1; i < len(results); i++ {
+		if tuple = BytesToKeyValue(results[i][0]); tuple != nil {
+			m[tuple.Key] = tuple.Value
+		}
+	}
+	return m, len(m) > 0
+}
+
+type KeyValueTuple struct {
+	Key   string
+	Value string
+}
+
+// BytesToKeyValue converts a slice of bytes to a KeyValueTuple struct, and
+// returns a pointer to KeyValueTuple on success or a nil on failure.
+func BytesToKeyValue(b []byte) *KeyValueTuple {
+	split := strings.Split(string(b), "=")
+	if len(split) != 2 {
+		return nil
+	}
+	return &KeyValueTuple{
+		Key:   split[0],
+		Value: split[1],
+	}
 }
 
 func getValue(k string, m map[string]interface{}) (string, bool) {
@@ -621,10 +734,8 @@ func (p *Publish) Close() {
 // NewPublish builds a ready-to-go Publish struct, mostly just sets-up
 // channels and such.
 func NewPublish(conf *args) *Publish {
-	var compiled *regexp.Regexp
-	if conf.parserPattern != "" {
-		compiled = regexp.MustCompile(conf.parserPattern)
-	}
+	var compiled = regexp.MustCompile(conf.parserPattern)
+
 	return &Publish{
 		conf: conf,
 		chans: &topics{
