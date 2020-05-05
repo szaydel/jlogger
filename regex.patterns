@@ -1,0 +1,8 @@
+syslog-rfc3164:
+^\<(?P<pri>[0-9]+)\>(?P<time>[^ ]* {1,2}[^ ]* [^ ]*) (?P<host>[^ ]*) (?P<ident>[a-zA-Z0-9_\/\.\-]*)(?:\[(?P<pid>[0-9]+)\])?(?:[^\:]*\:)? *(?P<message>.*)$
+
+syslog-rfc3164-local:
+^\<(?P<pri>[0-9]+)\>(?P<time>[^ ]* {1,2}[^ ]* [^ ]*) (?P<ident>[a-zA-Z0-9_\/\.\-]*)(?:\[(?P<pid>[0-9]+)\])?(?:[^\:]*\:)? *(?P<message>.*)$
+
+apache common:
+^(?P<client>\S+) \S+ (?P<userid>\S+) \[(?:[^\]]+)\] \"(?P<method>[A-Z]+) (?P<uri>[^"]+)? HTTP/[0-9.]+" (?P<status>[0-9]{3}) (?P<size>[0-9]+|-)$
