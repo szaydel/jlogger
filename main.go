@@ -105,14 +105,17 @@ func NewRedisConfig(name string) *RedisConfig {
 }
 
 type args struct {
-	redisConfigFile string
-	debug           bool
-	chanBufLen      int
-	key             string
-	level           string // not implemented yet
-	parserPattern   string
-	priority        string
-	tag             string
+	redisConfigFile   string
+	debug             bool
+	ignoreMissingMsg  bool
+	chanBufLen        int
+	chanTimeoutRedis  time.Duration
+	chanTimeoutSyslog time.Duration
+	key               string
+	level             string // not implemented yet
+	parserPattern     string
+	priority          string
+	tag               string
 }
 
 var cliArgs args
@@ -120,6 +123,9 @@ var cliArgs args
 func setupCliFlags() {
 	flag.IntVar(&cliArgs.chanBufLen, "channel.buffer.length", ChanBufferLen, "How many messages to allow in the buffer before discards may happen")
 	flag.BoolVar(&cliArgs.debug, "debug", false, "Enable debugging")
+	flag.BoolVar(&cliArgs.ignoreMissingMsg, "ignore.missing.msg", false, "Do not look for a message key after parsing lines")
+	flag.DurationVar(&cliArgs.chanTimeoutRedis, "redis.timeout.ms", ChanTimeout, "Set timeout value for sending messages to Redis")
+	flag.DurationVar(&cliArgs.chanTimeoutSyslog, "syslog.timeout.ms", ChanTimeout, "Set timeout value for sending messages to Syslog")
 	flag.StringVar(&cliArgs.key, "key", DefaultKey, "Key with which to publish messages")
 	flag.StringVar(&cliArgs.tag, "t", "demotag", "Tag with which to publish messages")
 	flag.StringVar(&cliArgs.parserPattern, "pattern", DefaultParserPattern, "Pattern containing minimally a <msg> capture group")
@@ -142,7 +148,7 @@ func strToFacility(s string, defaultFacility syslog.Priority) syslog.Priority {
 	if strings.Contains(s, ".") {
 		tokens := strings.Split(strings.ToLower(s), ".")
 		facilityStr = tokens[0]
-		log.Printf("facilityStr is: %s | tokens is %v", facilityStr, tokens)
+		// log.Printf("facilityStr is: %s | tokens is %v", facilityStr, tokens)
 	} else {
 		facilityStr = s
 	}
@@ -232,8 +238,10 @@ func loggerfn(level syslog.Priority, w *syslog.Writer) SyslogFunc {
 type stat uint16
 
 const (
-	Plain stat = iota
+	Line = iota
+	Plain
 	Json
+	JsonNoMsg
 	Duplicate
 	Crit
 	Err
@@ -273,12 +281,14 @@ func computeRatio(n, d int64) float64 {
 // from JSON messages where object contains field called "level", and that
 // field contains a name known to this utility.
 func (p *Publish) stats() {
-	const interval = 10
+	const reportInterval = 10
 	// Counters is meant to be private, but it is "exported" in order to be
 	// JSON-marshal(able). In reality, it is not visible outside of this method.
 	type Counters struct {
+		Line      int64 `json:"line"`
 		Plain     int64 `json:"plaintext"`
 		Json      int64 `json:"json_encoded"`
+		JsonNoMsg int64 `json:"json_encoded_missing_message"`
 		Duplicate int64 `json:"duplicate"`
 		Crit      int64 `json:"critical"`
 		Err       int64 `json:"error"`
@@ -288,14 +298,16 @@ func (p *Publish) stats() {
 		Debug     int64 `json:"debug"`
 	}
 	var counts [Unknown]int64
-	var t = time.NewTicker(interval * time.Second).C
+	var t = time.NewTicker(reportInterval * time.Second).C
 	for {
 		select {
 		case <-t:
 			b, _ := json.Marshal(
 				map[string]interface{}{
 					"counts": Counters{
+						Line:      counts[Line],
 						Plain:     counts[Plain],
+						JsonNoMsg: counts[JsonNoMsg],
 						Json:      counts[Json],
 						Duplicate: counts[Duplicate],
 						Crit:      counts[Crit],
@@ -309,7 +321,7 @@ func (p *Publish) stats() {
 				},
 			)
 			if p.conf.debug {
-				log.Printf("%s", string(b))
+				log.Printf("STATS: %s", string(b))
 			}
 			// Reset the counts after proceessing and reporting stats.
 			for i, _ := range counts {
@@ -349,7 +361,7 @@ func suppressedToMap(m *Message, td time.Duration) map[string]interface{} {
 	} else {
 		dup["alert"] = false
 	}
-	dup["time"] = time.Now().Format(time.RFC3339Nano)
+	dup["ts"] = time.Now().Format(time.RFC3339Nano)
 	return dup
 }
 
@@ -357,9 +369,9 @@ func suppressedToMap(m *Message, td time.Duration) map[string]interface{} {
 // for each message which was encountered more than once during previous
 // interval.
 func reportSuppressed(p *Publish, dupes *Messages) {
-	const interval = 60
+	const reportInterval = 60
 	var t = p.chans
-	var ticker = time.NewTicker(interval * time.Second)
+	var ticker = time.NewTicker(reportInterval * time.Second)
 	var timestamp = time.Now()
 	for {
 		select {
@@ -392,7 +404,8 @@ func dispatch(p *Publish, dupes *Messages) {
 	var validJSON bool
 	var content bytes.Buffer
 	for scnr.Scan() {
-		content.Reset() // Re-using the same buffer instead of re-allocating
+		content.Reset()     // Re-using the same buffer instead of re-allocating
+		p.statsChan <- Line // Keep a count of all lines received
 		validJSON = json.Valid(scnr.Bytes())
 		var m = make(map[string]interface{})
 		// When message is a JSON object, we want to use just the contents of
@@ -404,11 +417,13 @@ func dispatch(p *Publish, dupes *Messages) {
 		if validJSON {
 			p.statsChan <- Json
 			json.Unmarshal(scnr.Bytes(), &m)
-			if v, ok := getValue("msg", m); ok {
-				content.WriteString(v)
-			} else if v, ok := getValue("message", m); ok {
+			if v, ok := getMessage(m); ok {
 				content.WriteString(v)
 			} else {
+				if p.conf.debug {
+					log.Printf("Dropping, no message in: '%s'", scnr.Text())
+				}
+				p.statsChan <- JsonNoMsg
 				continue
 			}
 		} else {
@@ -427,19 +442,19 @@ func dispatch(p *Publish, dupes *Messages) {
 			select {
 			// Write message as-is without any transformations to syslog.
 			case t.syslogplaintext <- scnr.Bytes():
-			case <-time.After(ChanTimeout):
+			case <-time.After(p.conf.chanTimeoutSyslog):
 				// dropping this message instead of blocking here
 				if p.conf.debug {
-					log.Printf("dropped plaintext->syslog message after %v timeout", ChanTimeout)
+					log.Printf("dropped plaintext->syslog message after %v timeout", p.conf.chanTimeoutSyslog)
 				}
 			}
 			m = p.transform.MsgToMap(scnr)
 			select {
 			case t.json <- m:
-			case <-time.After(ChanTimeout):
+			case <-time.After(p.conf.chanTimeoutRedis):
 				// dropping this message instead of blocking here
 				if p.conf.debug {
-					log.Printf("dropped plaintext->redis message after %v timeout", ChanTimeout)
+					log.Printf("dropped plaintext->redis message after %v timeout", p.conf.chanTimeoutRedis)
 				}
 			}
 
@@ -483,18 +498,18 @@ func dispatch(p *Publish, dupes *Messages) {
 			// had a time field, we will add a new field called source_time,
 			// and add a time field with value of time.Now().
 			if v, ok := getValue("time", m); ok {
-				m["source_time"] = v
+				m["orig_ts"] = v
 			}
-			m["time"] = time.Now().Format(time.RFC3339Nano)
+			m["ts"] = time.Now().Format(time.RFC3339Nano)
 			select {
 			case t.json <- m:
 				if p.conf.debug {
 					log.Printf("JSON->redis: %v", m)
 				}
 
-			case <-time.After(ChanTimeout):
+			case <-time.After(p.conf.chanTimeoutRedis):
 				if p.conf.debug {
-					log.Println("dropped JSON->redis message after timeout")
+					log.Printf("dropped JSON->redis message after %v timeout", p.conf.chanTimeoutRedis)
 				}
 			}
 			select {
@@ -502,9 +517,9 @@ func dispatch(p *Publish, dupes *Messages) {
 				if p.conf.debug {
 					log.Printf("JSON->syslog: %v", m)
 				}
-			case <-time.After(ChanTimeout):
+			case <-time.After(p.conf.chanTimeoutSyslog):
 				if p.conf.debug {
-					log.Println("dropped JSON->redis message after timeout")
+					log.Printf("dropped JSON->syslog message after %v timeout", p.conf.chanTimeoutRedis)
 				}
 			}
 		}
@@ -586,14 +601,11 @@ func (p *Parser) MsgToMap(scnr *bufio.Scanner) map[string]interface{} {
 			}
 		}
 	}
-	// If after parsing the message we still do not have a `message` field, we
-	// use the entire line as message instead. This is a fallback really.
-	if _, ok := m["message"]; !ok {
-		m["message"] = scnr.Text() // may become "message" instead
-	}
-	if _, ok := m["key"]; !ok {
-		m["key"] = p.conf.key
-	}
+
+	setValueWhenMissing("key", p.conf.key, m)
+	// if _, ok := m["key"]; !ok {
+	// 	m["key"] = p.conf.key
+	// }
 	var level syslog.Priority
 	if _, ok := m["level"]; !ok {
 		level = detectLevel(scnr.Bytes())
@@ -605,8 +617,20 @@ func (p *Parser) MsgToMap(scnr *bufio.Scanner) map[string]interface{} {
 		m["ccs"] = false
 	}
 	m["source"] = p.conf.tag
-	m["time"] = time.Now().Format(time.RFC3339Nano)
+	m["ts"] = time.Now().Format(time.RFC3339Nano)
 	m["plaintext"] = true
+
+	if p.conf.ignoreMissingMsg {
+		return m
+	}
+
+	// If after parsing the message we still do not have a `message` field, we
+	// use the entire line as message instead. This is a fallback really.
+	// getStringValueOrDefault("message", scnr.Text(), m)
+	if _, ok := getMessage(m); !ok {
+		m["message"] = scnr.Text()
+	}
+
 	return m
 }
 
@@ -629,11 +653,11 @@ func (p *Parser) parse(b []byte) (map[string]string, bool) {
 
 	// Here we are making the assumption that a regex pattern has been provided
 	// as an argument to this program, and it contains one or more named capture
-	// groups, one of which extracts the message and is called `message` and 
-	// others, if there are any, are going to be any additional labels, such as 
-	// the level of this message, or any other "tags" that we want to include 
+	// groups, one of which extracts the message and is called `message` and
+	// others, if there are any, are going to be any additional labels, such as
+	// the level of this message, or any other "tags" that we want to include
 	// with this message.
-	// Names of each capture group will become the keys, and correspond to 
+	// Names of each capture group will become the keys, and correspond to
 	// values which they are supposed to extract from the message.
 	m := make(map[string]string, len(results[0])-1)
 	for i, value := range results[0] {
@@ -649,7 +673,7 @@ func (p *Parser) parse(b []byte) (map[string]string, bool) {
 // defaultRegexpMatchesToMap handles the default Regular Expression pattern,
 // which assumes a plaintext message with one or more key=value pairs after the
 // actual message. Notice, key=value pairs are only matched if there is a
-// leading double-space `\s\s` after the actual message string, as in this 
+// leading double-space `\s\s` after the actual message string, as in this
 // example:
 // `Important thingy failed  level=error function=thingyAlpha`.
 func (p *Parser) defaultRegexpMatchesToMap(results [][][]byte) (map[string]string, bool) {
@@ -690,6 +714,15 @@ func BytesToKeyValue(b []byte) *KeyValueTuple {
 	}
 }
 
+func getMessage(m map[string]interface{}) (string, bool) {
+	for _, key := range []string{"message", "msg"} {
+		if v, ok := (m[key]).(string); ok {
+			return v, true
+		}
+	}
+	return "", false
+}
+
 func getValue(k string, m map[string]interface{}) (string, bool) {
 	if v, ok := (m[k]).(string); ok {
 		return v, true
@@ -697,9 +730,15 @@ func getValue(k string, m map[string]interface{}) (string, bool) {
 	return "", false
 }
 
+func setValueWhenMissing(k, v string, m map[string]interface{}) {
+	if _, ok := m[k]; !ok {
+		m[k] = v
+	}
+	return
+}
+
 type topics struct {
 	json            chan map[string]interface{}
-	plaintext       chan map[string]interface{}
 	syslogjson      chan map[string]interface{}
 	syslogplaintext chan []byte
 }
@@ -741,7 +780,6 @@ func NewPublish(conf *args) *Publish {
 		chans: &topics{
 			json:            make(chan map[string]interface{}, conf.chanBufLen),
 			syslogjson:      make(chan map[string]interface{}, conf.chanBufLen),
-			plaintext:       make(chan map[string]interface{}, conf.chanBufLen),
 			syslogplaintext: make(chan []byte, conf.chanBufLen),
 		},
 		ackDoneChan: make(chan struct{}),
@@ -781,7 +819,6 @@ func (p *Publish) publishToSyslogJSON(w *syslog.Writer) {
 			var levelStr string
 			var ok bool
 			if levelStr, ok = getValue("level", obj); !ok {
-				// levelStr = levelToStr(defaultLevel, "")
 				levelStr = p.conf.level
 				obj["level"] = levelStr
 			}
@@ -876,6 +913,8 @@ func main() {
 	rdb := redis.NewClient(redisConfig)
 
 	sysLog, err := syslog.Dial(
+		// "tcp",
+		// "localhost:5514",
 		"unixgram",
 		"/dev/log",
 		strToPriority(
