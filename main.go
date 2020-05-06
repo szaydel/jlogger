@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -38,6 +39,8 @@ const (
 
 	DefaultKey = "SyslogMessage"
 )
+
+var errTimedOut = errors.New("Write failed with a timeout")
 
 var levelsRegexp = struct {
 	debug *regexp.Regexp
@@ -171,11 +174,16 @@ func strToLevel(s string, defaultLevel syslog.Priority) syslog.Priority {
 		"debug":   syslog.LOG_DEBUG,
 	}
 	var levelStr string
-	if strings.Contains(s, ".") {
-		tokens := strings.Split(strings.ToLower(s), ".")
+	var tokens []string
+
+	tokens = strings.Split(strings.ToLower(s), ".")
+	switch len(tokens) {
+	// We are only extracting level in this case
+	case 1:
+		levelStr = tokens[0]
+	// We are expecting facility and level in this case
+	case 2:
 		levelStr = tokens[1]
-	} else {
-		levelStr = s
 	}
 	if level, ok := mapStrToLevel[levelStr]; ok {
 		return level
@@ -188,8 +196,9 @@ func strToPriority(
 	defaultLevel, defaultFacility syslog.Priority,
 ) syslog.Priority {
 	var facility, level syslog.Priority
-	tokens := strings.Split(strings.ToLower(s), ".")
+	var tokens []string
 
+	tokens = strings.Split(strings.ToLower(s), ".")
 	switch len(tokens) {
 	// We are only extracting level in this case
 	case 1:
@@ -396,6 +405,20 @@ func reportSuppressed(p *Publish, dupes *Messages) {
 	}
 }
 
+// PutWithTimeout sends the message on the supplied channel and times out after
+// interval `t` if the channel in argument `c` is blocked.
+func PutWithTimeout(
+	c chan map[string]interface{},
+	m map[string]interface{},
+	t time.Duration) error {
+	select {
+	case c <- m:
+		return nil
+	case <-time.After(t):
+		return errTimedOut
+	}
+}
+
 // dispatch is where data from stdin is read, digested, and dispatched to
 // functions which send it to Redis or syslog.
 func dispatch(p *Publish, dupes *Messages) {
@@ -443,34 +466,32 @@ func dispatch(p *Publish, dupes *Messages) {
 			// Write message as-is without any transformations to syslog.
 			case t.syslogplaintext <- scnr.Bytes():
 			case <-time.After(p.conf.chanTimeoutSyslog):
-				// dropping this message instead of blocking here
 				if p.conf.debug {
 					log.Printf("dropped plaintext->syslog message after %v timeout", p.conf.chanTimeoutSyslog)
 				}
 			}
 			m = p.transform.MsgToMap(scnr)
-			select {
-			case t.json <- m:
-			case <-time.After(p.conf.chanTimeoutRedis):
-				// dropping this message instead of blocking here
+			switch PutWithTimeout(t.json, m, p.conf.chanTimeoutRedis) {
+			case errTimedOut:
 				if p.conf.debug {
-					log.Printf("dropped plaintext->redis message after %v timeout", p.conf.chanTimeoutRedis)
+					log.Printf("dropped PLAIN->redis message after %v timeout", p.conf.chanTimeoutRedis)
+				}
+			case nil:
+				if p.conf.debug {
+					log.Printf("PLAIN->redis: %v", m)
 				}
 			}
 
-			if p.conf.debug {
-				log.Printf("(plaintext): %v", m)
-			}
 		} else { // Valid JSON extracted from stdin
 			// When "source" key does not exist, we use the tag `-t` with which
 			// this program was started.
 			if _, ok := getValue("source", m); !ok {
 				m["source"] = p.source
 			}
-			// Fallback to generic key, which we have been using historically
-			// in this context.
+			// Fallback to default key or key supplied via command line
+			// argument.
 			if _, ok := getValue("key", m); !ok {
-				m["key"] = "SyslogMessage"
+				m["key"] = p.conf.key
 			}
 			// We attempt to derive level from the data if we don't already
 			// have it in this map.
@@ -501,25 +522,27 @@ func dispatch(p *Publish, dupes *Messages) {
 				m["orig_ts"] = v
 			}
 			m["ts"] = time.Now().Format(time.RFC3339Nano)
-			select {
-			case t.json <- m:
-				if p.conf.debug {
-					log.Printf("JSON->redis: %v", m)
-				}
-
-			case <-time.After(p.conf.chanTimeoutRedis):
+			// Send map with message contents to Redis and Syslog publishing
+			// goroutines. Timeout after specified interval by selecting on
+			// the supplied channel and a timer channel.
+			switch PutWithTimeout(t.json, m, p.conf.chanTimeoutRedis) {
+			case errTimedOut:
 				if p.conf.debug {
 					log.Printf("dropped JSON->redis message after %v timeout", p.conf.chanTimeoutRedis)
 				}
-			}
-			select {
-			case t.syslogjson <- m:
+			case nil:
 				if p.conf.debug {
-					log.Printf("JSON->syslog: %v", m)
+					log.Printf("JSON->redis: %v", m)
 				}
-			case <-time.After(p.conf.chanTimeoutSyslog):
+			}
+			switch PutWithTimeout(t.syslogjson, m, p.conf.chanTimeoutSyslog) {
+			case errTimedOut:
 				if p.conf.debug {
 					log.Printf("dropped JSON->syslog message after %v timeout", p.conf.chanTimeoutRedis)
+				}
+			case nil:
+				if p.conf.debug {
+					log.Printf("JSON->syslog: %v", m)
 				}
 			}
 		}
@@ -800,7 +823,7 @@ func (p *Publish) publishToSyslog(
 		select {
 		case msg := <-p.chans.syslogplaintext:
 			if _, err := fmt.Fprintf(w, "%s", msg); err != nil {
-				log.Printf("syslog failed: %v", err)
+				log.Printf("PLAIN->syslog failed: %v", err)
 			}
 		case <-p.doneChan:
 			if p.conf.debug {
