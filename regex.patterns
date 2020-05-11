@@ -6,3 +6,7 @@ syslog-rfc3164-local:
 
 apache common:
 ^(?P<client>\S+) \S+ (?P<userid>\S+) \[(?:[^\]]+)\] \"(?P<method>[A-Z]+) (?P<uri>[^"]+)? HTTP/[0-9.]+" (?P<status>[0-9]{3}) (?P<size>[0-9]+|-)$
+
+Message with optional timestamp as unix seconds.milliseconds:
+ex => 1589199560.710425 received termination signal
+(?:\d+\.\d+)? ?(?P<message>.*)
