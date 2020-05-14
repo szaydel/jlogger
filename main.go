@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -38,6 +37,12 @@ const (
 	DefaultParserPattern = `(?m)(?P<message>^.*)\s\s|(?P<labels>\w+=\w+)`
 
 	DefaultKey = "SyslogMessage"
+
+	// DefaultExpireDupesAfter is the amount of time after which a previously
+	// seen message will not be considered a duplicate. For example, if the
+	// if this value is N, and two identical messages are logged N + 1 units
+	// of time apart, they will not be considered duplicates.
+	DefaultExpireDupesAfter = 10 * time.Second
 )
 
 var errTimedOut = errors.New("Write failed with a timeout")
@@ -114,6 +119,7 @@ type args struct {
 	chanBufLen        int
 	chanTimeoutRedis  time.Duration
 	chanTimeoutSyslog time.Duration
+	expireDupesAfter  time.Duration
 	key               string
 	level             string // not implemented yet
 	parserPattern     string
@@ -129,6 +135,7 @@ func setupCliFlags() {
 	flag.BoolVar(&cliArgs.ignoreMissingMsg, "ignore.missing.msg", false, "Do not look for a message key after parsing lines")
 	flag.DurationVar(&cliArgs.chanTimeoutRedis, "redis.timeout.ms", ChanTimeout, "Set timeout value for sending messages to Redis")
 	flag.DurationVar(&cliArgs.chanTimeoutSyslog, "syslog.timeout.ms", ChanTimeout, "Set timeout value for sending messages to Syslog")
+	flag.DurationVar(&cliArgs.expireDupesAfter, "expire.dupes.after.s", DefaultExpireDupesAfter, "Amount of time after which previously seen message is not a duplicate")
 	flag.StringVar(&cliArgs.key, "key", DefaultKey, "Key with which to publish messages")
 	flag.StringVar(&cliArgs.tag, "t", "demotag", "Tag with which to publish messages")
 	flag.StringVar(&cliArgs.parserPattern, "pattern", DefaultParserPattern, "Pattern containing minimally a <msg> capture group")
@@ -332,10 +339,12 @@ func (p *Publish) stats() {
 			if p.conf.debug {
 				log.Printf("STATS: %s", string(b))
 			}
-			// Reset the counts after proceessing and reporting stats.
-			for i, _ := range counts {
-				counts[i] = 0
-			}
+			// Reset the counts after proceessing and reporting stats. We may
+			// want to re-enable this, but right now I want to keep these as
+			// counters instead of gauges.
+			// for i, _ := range counts {
+			// 	counts[i] = 0
+			// }
 		case v := <-p.statsChan:
 			if v < Unknown {
 				counts[v]++
@@ -378,7 +387,7 @@ func suppressedToMap(m *Message, td time.Duration) map[string]interface{} {
 // for each message which was encountered more than once during previous
 // interval.
 func reportSuppressed(p *Publish, dupes *Messages) {
-	const reportInterval = 60
+	const reportInterval = 10
 	var t = p.chans
 	var ticker = time.NewTicker(reportInterval * time.Second)
 	var timestamp = time.Now()
@@ -399,7 +408,7 @@ func reportSuppressed(p *Publish, dupes *Messages) {
 					}
 				}
 			}
-			dupes.Reset()
+			dupes.Expire(p.conf.expireDupesAfter)
 			timestamp = time.Now() // update timestamp for next report
 		}
 	}
@@ -419,18 +428,45 @@ func PutWithTimeout(
 	}
 }
 
+func PutWithTimeoutSyslogPlainText(
+	c chan []byte,
+	b []byte,
+	t time.Duration) error {
+	select {
+	case c <- b:
+		return nil
+	case <-time.After(t):
+		return errTimedOut
+	}
+}
+
 // dispatch is where data from stdin is read, digested, and dispatched to
 // functions which send it to Redis or syslog.
 func dispatch(p *Publish, dupes *Messages) {
 	var t = p.chans
 	var scnr = bufio.NewScanner(os.Stdin)
 	var validJSON bool
-	var content bytes.Buffer
+	var msgBody []byte
 	for scnr.Scan() {
-		content.Reset()     // Re-using the same buffer instead of re-allocating
 		p.statsChan <- Line // Keep a count of all lines received
-		validJSON = json.Valid(scnr.Bytes())
+
 		var m = make(map[string]interface{})
+		nbytes := len(scnr.Bytes())
+		// When there is effectively just a `\n`, we just want to read the
+		// following line.
+		if nbytes == 0 {
+			continue
+		}
+		// Do a simple check to see if there is any chance that this buffer
+		// actually contains valid JSON.
+		if scnr.Bytes()[0] == '{' &&
+			scnr.Bytes()[nbytes-1] == '}' {
+			if err := json.Unmarshal(scnr.Bytes(), &m); err == nil {
+				validJSON = true
+			}
+		} else {
+			validJSON = false
+		}
 		// When message is a JSON object, we want to use just the contents of
 		// "msg" or "message" field for the purposes of establishing uniqueness
 		// of the message. Because it is a serialized object, which likely
@@ -439,22 +475,17 @@ func dispatch(p *Publish, dupes *Messages) {
 		// otherwise we won't be able to detect duplicate messages.
 		if validJSON {
 			p.statsChan <- Json
-			json.Unmarshal(scnr.Bytes(), &m)
-			if v, ok := getMessage(m); ok {
-				content.WriteString(v)
-			} else {
-				if p.conf.debug {
-					log.Printf("Dropping, no message in: '%s'", scnr.Text())
-				}
-				p.statsChan <- JsonNoMsg
+			var ok bool
+			if msgBody, ok = getMessageBytes(m); !ok {
+				log.Printf("Discarding, no 'message' key in: '%s'", scnr.Text())
 				continue
 			}
 		} else {
 			p.statsChan <- Plain
-			content.Write(scnr.Bytes())
+			m = p.transform.MsgToMap(scnr)
+			msgBody = []byte(m["message"].(string))
 		}
-
-		if !dupes.Insert(content.Bytes()) {
+		if !dupes.Insert(msgBody) {
 			p.statsChan <- Duplicate
 			continue
 		}
@@ -462,15 +493,19 @@ func dispatch(p *Publish, dupes *Messages) {
 		// If this is valid JSON, publish it to a JSON messages channel, else
 		// it goes to the plaintext channel.
 		if !validJSON { // Invalid JSON extracted from stdin
-			select {
 			// Write message as-is without any transformations to syslog.
-			case t.syslogplaintext <- scnr.Bytes():
-			case <-time.After(p.conf.chanTimeoutSyslog):
+			switch PutWithTimeoutSyslogPlainText(
+				t.syslogplaintext, scnr.Bytes(), p.conf.chanTimeoutSyslog) {
+			case errTimedOut:
 				if p.conf.debug {
-					log.Printf("dropped plaintext->syslog message after %v timeout", p.conf.chanTimeoutSyslog)
+					log.Printf("dropped plaintext->syslog message after %v timeout", p.conf.chanTimeoutRedis)
+				}
+			case nil:
+				if p.conf.debug {
+					log.Printf("PLAIN->syslog: %v", m)
 				}
 			}
-			m = p.transform.MsgToMap(scnr)
+
 			switch PutWithTimeout(t.json, m, p.conf.chanTimeoutRedis) {
 			case errTimedOut:
 				if p.conf.debug {
@@ -626,9 +661,6 @@ func (p *Parser) MsgToMap(scnr *bufio.Scanner) map[string]interface{} {
 	}
 
 	setValueWhenMissing("key", p.conf.key, m)
-	// if _, ok := m["key"]; !ok {
-	// 	m["key"] = p.conf.key
-	// }
 	var level syslog.Priority
 	if _, ok := m["level"]; !ok {
 		level = detectLevel(scnr.Bytes())
@@ -744,6 +776,15 @@ func getMessage(m map[string]interface{}) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+func getMessageBytes(m map[string]interface{}) ([]byte, bool) {
+	for _, key := range []string{"message", "msg"} {
+		if v, ok := (m[key]).(string); ok {
+			return []byte(v), true
+		}
+	}
+	return []byte{}, false
 }
 
 func getValue(k string, m map[string]interface{}) (string, bool) {

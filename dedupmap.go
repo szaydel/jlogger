@@ -3,11 +3,13 @@ package main
 import (
 	"encoding/json"
 	"sync"
+	"time"
 )
 
 type Message struct {
-	data  []byte
-	count uint64
+	data      []byte
+	count     uint64
+	timestamp time.Time
 }
 
 type CounterMap map[uint32]*Message
@@ -47,10 +49,11 @@ func (m *Messages) Insert(b []byte) bool {
 	defer m.mtx.Unlock()
 	sum := m.sum(b)
 	if _, ok := m.cm[sum]; !ok {
-		m.cm[sum] = &Message{b, 0}
+		m.cm[sum] = &Message{b, 0, time.Now()}
 		return true
 	}
 	m.cm[sum].count++
+	m.cm[sum].timestamp = time.Now()
 	return false
 }
 
@@ -75,4 +78,19 @@ func (m *Messages) Reset() {
 	defer m.mtx.Unlock()
 	// We actually reset by creating a new map, seems odd, yes...
 	m.cm = make(CounterMap)
+}
+
+// Expire clears entries from the counter map structure which have not been
+// seen for at least t amount of time.
+func (m *Messages) Expire(t time.Duration) {
+	m.mtx.Lock()
+	now := time.Now()
+	defer m.mtx.Unlock()
+	for k, v := range m.cm {
+		// If a given message has not been seen for at least td units of time,
+		// expire this message from the map.
+		if now.After(v.timestamp.Add(t)) {
+			delete(m.cm, k)
+		}
+	}
 }
