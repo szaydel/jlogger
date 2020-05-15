@@ -6,7 +6,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"log/syslog"
 	"os"
@@ -125,6 +124,10 @@ type args struct {
 	parserPattern     string
 	priority          string
 	tag               string
+}
+
+func (a *args) SyslogLevel() syslog.Priority {
+	return strToLevel(a.level, syslog.LOG_NOTICE)
 }
 
 var cliArgs args
@@ -428,18 +431,6 @@ func PutWithTimeout(
 	}
 }
 
-func PutWithTimeoutSyslogPlainText(
-	c chan []byte,
-	b []byte,
-	t time.Duration) error {
-	select {
-	case c <- b:
-		return nil
-	case <-time.After(t):
-		return errTimedOut
-	}
-}
-
 // dispatch is where data from stdin is read, digested, and dispatched to
 // functions which send it to Redis or syslog.
 func dispatch(p *Publish, dupes *Messages) {
@@ -493,19 +484,6 @@ func dispatch(p *Publish, dupes *Messages) {
 		// If this is valid JSON, publish it to a JSON messages channel, else
 		// it goes to the plaintext channel.
 		if !validJSON { // Invalid JSON extracted from stdin
-			// Write message as-is without any transformations to syslog.
-			switch PutWithTimeoutSyslogPlainText(
-				t.syslogplaintext, scnr.Bytes(), p.conf.chanTimeoutSyslog) {
-			case errTimedOut:
-				if p.conf.debug {
-					log.Printf("dropped plaintext->syslog message after %v timeout", p.conf.chanTimeoutRedis)
-				}
-			case nil:
-				if p.conf.debug {
-					log.Printf("PLAIN->syslog: %v", m)
-				}
-			}
-
 			switch PutWithTimeout(t.json, m, p.conf.chanTimeoutRedis) {
 			case errTimedOut:
 				if p.conf.debug {
@@ -516,7 +494,17 @@ func dispatch(p *Publish, dupes *Messages) {
 					log.Printf("PLAIN->redis: %v", m)
 				}
 			}
-
+			switch PutWithTimeout(
+				t.syslogplaintext, m, p.conf.chanTimeoutSyslog) {
+			case errTimedOut:
+				if p.conf.debug {
+					log.Printf("dropped PLAIN->syslog message after %v timeout", p.conf.chanTimeoutSyslog)
+				}
+			case nil:
+				if p.conf.debug {
+					log.Printf("PLAIN->syslog: %v", m)
+				}
+			}
 		} else { // Valid JSON extracted from stdin
 			// When "source" key does not exist, we use the tag `-t` with which
 			// this program was started.
@@ -536,7 +524,7 @@ func dispatch(p *Publish, dupes *Messages) {
 				m["level"] = levelToStr(level, p.conf.level)
 			} else {
 				level = strToPriority(
-					levelStr, syslog.LOG_NOTICE, 0)
+					levelStr, p.conf.SyslogLevel(), 0)
 			}
 
 			// If there is no ccs field, we add it, and set it to true if level
@@ -804,7 +792,8 @@ func setValueWhenMissing(k, v string, m map[string]interface{}) {
 type topics struct {
 	json            chan map[string]interface{}
 	syslogjson      chan map[string]interface{}
-	syslogplaintext chan []byte
+	syslogplaintext chan map[string]interface{}
+	// syslogplaintext chan []byte
 }
 
 // Publish implements message publishing part of the program. Methods on this
@@ -844,7 +833,7 @@ func NewPublish(conf *args) *Publish {
 		chans: &topics{
 			json:            make(chan map[string]interface{}, conf.chanBufLen),
 			syslogjson:      make(chan map[string]interface{}, conf.chanBufLen),
-			syslogplaintext: make(chan []byte, conf.chanBufLen),
+			syslogplaintext: make(chan map[string]interface{}, conf.chanBufLen),
 		},
 		ackDoneChan: make(chan struct{}),
 		doneChan:    make(chan struct{}),
@@ -858,13 +847,26 @@ func NewPublish(conf *args) *Publish {
 }
 
 func (p *Publish) publishToSyslog(
-	w io.Writer,
+	w *syslog.Writer,
 ) {
 	for {
 		select {
-		case msg := <-p.chans.syslogplaintext:
-			if _, err := fmt.Fprintf(w, "%s", msg); err != nil {
-				log.Printf("PLAIN->syslog failed: %v", err)
+		case m := <-p.chans.syslogplaintext:
+			var levelStr string
+			var ok bool
+			if levelStr, ok = getValue("level", m); !ok {
+				levelStr = p.conf.level
+				m["level"] = levelStr
+			}
+			for _, k := range [...]string{"message", "msg"} {
+				if v, ok := getValue(k, m); ok {
+					level := strToLevel(levelStr, p.conf.SyslogLevel())
+					fn := loggerfn(level, w)
+					if err := fn(v); err != nil {
+						panic(err)
+					}
+					break
+				}
 			}
 		case <-p.doneChan:
 			if p.conf.debug {
@@ -879,20 +881,20 @@ func (p *Publish) publishToSyslog(
 func (p *Publish) publishToSyslogJSON(w *syslog.Writer) {
 	for {
 		select {
-		case obj := <-p.chans.syslogjson:
+		case m := <-p.chans.syslogjson:
 			var levelStr string
 			var ok bool
-			if levelStr, ok = getValue("level", obj); !ok {
+			if levelStr, ok = getValue("level", m); !ok {
 				levelStr = p.conf.level
-				obj["level"] = levelStr
+				m["level"] = levelStr
 			}
 			// Expect that message key could be either "msg" or "message".
 			// If neither is found, or not a string value, we abandon processing
 			// this particular object.
 			// var msg string
-			for _, k := range [...]string{"msg", "message"} {
-				if v, ok := getValue(k, obj); ok {
-					level := strToLevel(levelStr, syslog.LOG_NOTICE)
+			for _, k := range [...]string{"message", "msg"} {
+				if v, ok := getValue(k, m); ok {
+					level := strToLevel(levelStr, p.conf.SyslogLevel())
 					fn := loggerfn(level, w)
 					if err := fn(v); err != nil {
 						panic(err)
