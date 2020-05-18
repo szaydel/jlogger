@@ -45,6 +45,7 @@ const (
 )
 
 var errTimedOut = errors.New("Write failed with a timeout")
+var errMissingMsgKey = errors.New("Mapping missing required message key")
 
 var levelsRegexp = struct {
 	debug *regexp.Regexp
@@ -58,15 +59,15 @@ var levelsRegexp = struct {
 	warn:  regexp.MustCompile("(?i:warn|caution)"),
 }
 
-func detectLevel(b []byte) syslog.Priority {
+func detectLevel(scnr *bufio.Scanner) syslog.Priority {
 	switch {
-	case levelsRegexp.err.Match(b):
+	case levelsRegexp.err.Match(scnr.Bytes()):
 		return syslog.LOG_ERR
-	case levelsRegexp.warn.Match(b):
+	case levelsRegexp.warn.Match(scnr.Bytes()):
 		return syslog.LOG_WARNING
-	case levelsRegexp.info.Match(b):
+	case levelsRegexp.info.Match(scnr.Bytes()):
 		return syslog.LOG_INFO
-	case levelsRegexp.debug.Match(b):
+	case levelsRegexp.debug.Match(scnr.Bytes()):
 		return syslog.LOG_DEBUG
 	default:
 		return syslog.LOG_NOTICE
@@ -128,6 +129,10 @@ type args struct {
 
 func (a *args) SyslogLevel() syslog.Priority {
 	return strToLevel(a.level, syslog.LOG_NOTICE)
+}
+
+func (a *args) SyslogLevelString() string {
+	return a.level
 }
 
 var cliArgs args
@@ -237,21 +242,6 @@ func levelToStr(level syslog.Priority, defaultLevelStr string) string {
 		return levelStr
 	}
 	return defaultLevelStr
-}
-
-// SyslogFunc is a function prototype for a function returned from loggerfn.
-type SyslogFunc func(string) error
-
-func loggerfn(level syslog.Priority, w *syslog.Writer) SyslogFunc {
-	var mapLevelToFunc = map[syslog.Priority]SyslogFunc{
-		syslog.LOG_CRIT:    w.Crit,
-		syslog.LOG_ERR:     w.Err,
-		syslog.LOG_WARNING: w.Warning,
-		syslog.LOG_NOTICE:  w.Notice,
-		syslog.LOG_INFO:    w.Info,
-		syslog.LOG_DEBUG:   w.Debug,
-	}
-	return mapLevelToFunc[level]
 }
 
 type stat uint16
@@ -520,7 +510,7 @@ func dispatch(p *Publish, dupes *Messages) {
 			// have it in this map.
 			var level syslog.Priority
 			if levelStr, ok := getValue("level", m); !ok {
-				level = detectLevel(scnr.Bytes())
+				level = detectLevel(scnr)
 				m["level"] = levelToStr(level, p.conf.level)
 			} else {
 				level = strToPriority(
@@ -635,6 +625,9 @@ func StringToBool(s string) bool {
 	return m[s]
 }
 
+// MsgToMap takes a pointer to a buffer from the dispatch(...) function and
+// attempts to extract a few details by parsing the message either using the
+// default pattern or pattern supplied via command line argument.
 func (p *Parser) MsgToMap(scnr *bufio.Scanner) map[string]interface{} {
 	m := make(map[string]interface{})
 	results, ok := p.parse(scnr.Bytes())
@@ -651,7 +644,7 @@ func (p *Parser) MsgToMap(scnr *bufio.Scanner) map[string]interface{} {
 	setValueWhenMissing("key", p.conf.key, m)
 	var level syslog.Priority
 	if _, ok := m["level"]; !ok {
-		level = detectLevel(scnr.Bytes())
+		level = detectLevel(scnr)
 		m["level"] = levelToStr(level, p.conf.level)
 	}
 	if level < syslog.LOG_DEBUG {
@@ -793,7 +786,6 @@ type topics struct {
 	json            chan map[string]interface{}
 	syslogjson      chan map[string]interface{}
 	syslogplaintext chan map[string]interface{}
-	// syslogplaintext chan []byte
 }
 
 // Publish implements message publishing part of the program. Methods on this
@@ -813,7 +805,7 @@ type Publish struct {
 // Close shuts down publishers, and should be called before terminating
 // the program.
 func (p *Publish) Close() {
-	const numOfWorkers = 4
+	const numOfWorkers = 3
 	close(p.doneChan)
 	// This blocks until all publishers acknowledge and corresponding
 	// goroutines return. We do not close any of the *topics channels to avoid
@@ -846,65 +838,71 @@ func NewPublish(conf *args) *Publish {
 	}
 }
 
-func (p *Publish) publishToSyslog(
-	w *syslog.Writer,
-) {
+// SyslogFunc is a function prototype for a function returned from loggerfn.
+type SyslogFunc func(string) error
+
+func logWriterForLevel(levelStr string, w SyslogWriter) SyslogFunc {
+	var mapLevelToFunc = map[syslog.Priority]SyslogFunc{
+		syslog.LOG_CRIT:    w.Crit,
+		syslog.LOG_ERR:     w.Err,
+		syslog.LOG_WARNING: w.Warning,
+		syslog.LOG_NOTICE:  w.Notice,
+		syslog.LOG_INFO:    w.Info,
+		syslog.LOG_DEBUG:   w.Debug,
+	}
+
+	var level = strToLevel(levelStr, syslog.LOG_NOTICE)
+	return mapLevelToFunc[level]
+}
+
+// SyslogWriter is an interface which for some reason does not exist in the go
+// standard library's syslog package. This was added mainly to make testing
+// easier in the future.
+type SyslogWriter interface {
+	Close() error
+	Write(b []byte) (int, error)
+	Emerg(m string) error
+	Alert(m string) error
+	Crit(m string) error
+	Err(m string) error
+	Warning(m string) error
+	Notice(m string) error
+	Info(m string) error
+	Debug(m string) error
+}
+
+func mapToSyslogWriter(
+	m map[string]interface{},
+	levelStr string,
+	w SyslogWriter) error {
+	// If the mapping does not already have a level key, use the fallback
+	// value passed in via levelStr.
+	if _, ok := getValue("level", m); !ok {
+		m["level"] = levelStr
+	}
+	// Expect that message key could be either "msg" or "message".
+	// If neither is found, or not a string value, we abandon processing
+	// this particular object.
+	// var msg string
+	for _, k := range [...]string{"message", "msg"} {
+		if v, ok := getValue(k, m); ok {
+			fn := logWriterForLevel(m["level"].(string), w)
+			return fn(v)
+		}
+	}
+	return errMissingMsgKey
+}
+
+func (p *Publish) publishToSyslog(w SyslogWriter) {
 	for {
 		select {
 		case m := <-p.chans.syslogplaintext:
-			var levelStr string
-			var ok bool
-			if levelStr, ok = getValue("level", m); !ok {
-				levelStr = p.conf.level
-				m["level"] = levelStr
-			}
-			for _, k := range [...]string{"message", "msg"} {
-				if v, ok := getValue(k, m); ok {
-					level := strToLevel(levelStr, p.conf.SyslogLevel())
-					fn := loggerfn(level, w)
-					if err := fn(v); err != nil {
-						panic(err)
-					}
-					break
-				}
-			}
+			mapToSyslogWriter(m, p.conf.SyslogLevelString(), w)
+		case m := <-p.chans.syslogjson:
+			mapToSyslogWriter(m, p.conf.SyslogLevelString(), w)
 		case <-p.doneChan:
 			if p.conf.debug {
 				log.Println("Shutting down publishToSyslog")
-			}
-			p.ackDoneChan <- struct{}{}
-			return
-		}
-	}
-}
-
-func (p *Publish) publishToSyslogJSON(w *syslog.Writer) {
-	for {
-		select {
-		case m := <-p.chans.syslogjson:
-			var levelStr string
-			var ok bool
-			if levelStr, ok = getValue("level", m); !ok {
-				levelStr = p.conf.level
-				m["level"] = levelStr
-			}
-			// Expect that message key could be either "msg" or "message".
-			// If neither is found, or not a string value, we abandon processing
-			// this particular object.
-			// var msg string
-			for _, k := range [...]string{"message", "msg"} {
-				if v, ok := getValue(k, m); ok {
-					level := strToLevel(levelStr, p.conf.SyslogLevel())
-					fn := loggerfn(level, w)
-					if err := fn(v); err != nil {
-						panic(err)
-					}
-					break
-				}
-			}
-		case <-p.doneChan:
-			if p.conf.debug {
-				log.Println("Shutting down publishToSyslogJSON")
 			}
 			p.ackDoneChan <- struct{}{}
 			return
@@ -1000,9 +998,7 @@ func main() {
 
 	// Start statistics processing goroutine
 	go p.stats()
-	// Start syslog writing goroutine for JSON messages
-	go p.publishToSyslogJSON(sysLog)
-	// Start syslog writing goroutine for plaintext messages
+	// Start syslog writing goroutine for Plaintext and JSON messages to syslog
 	go p.publishToSyslog(sysLog)
 	// Start Redis publishing goroutine
 	go p.publishToDatabase(rdb)
