@@ -116,6 +116,8 @@ type args struct {
 	redisConfigFile   string
 	debug             bool
 	ignoreMissingMsg  bool
+	syslogDisabled    bool
+	redisDisabled     bool
 	chanBufLen        int
 	chanTimeoutRedis  time.Duration
 	chanTimeoutSyslog time.Duration
@@ -141,6 +143,8 @@ func setupCliFlags() {
 	flag.IntVar(&cliArgs.chanBufLen, "channel.buffer.length", ChanBufferLen, "How many messages to allow in the buffer before discards may happen")
 	flag.BoolVar(&cliArgs.debug, "debug", false, "Enable debugging")
 	flag.BoolVar(&cliArgs.ignoreMissingMsg, "ignore.missing.msg", false, "Do not look for a message key after parsing lines")
+	flag.BoolVar(&cliArgs.redisDisabled, "redis.disabled", false, "Skip publishing to redis when set")
+	flag.BoolVar(&cliArgs.syslogDisabled, "syslog.disabled", false, "Skip publishing to syslog when set")
 	flag.DurationVar(&cliArgs.chanTimeoutRedis, "redis.timeout.ms", ChanTimeout, "Set timeout value for sending messages to Redis")
 	flag.DurationVar(&cliArgs.chanTimeoutSyslog, "syslog.timeout.ms", ChanTimeout, "Set timeout value for sending messages to Syslog")
 	flag.DurationVar(&cliArgs.expireDupesAfter, "expire.dupes.after.s", DefaultExpireDupesAfter, "Amount of time after which previously seen message is not a duplicate")
@@ -394,11 +398,34 @@ func reportSuppressed(p *Publish, dupes *Messages) {
 					m["suppressed_per_sec"] = float64(m["suppressed"].(uint64)) / delta.Seconds()
 					m["source"] = p.source
 					m["key"] = "SuppressedMessage"
-					select {
-					case t.json <- m:
-					case <-time.After(ChanTimeout):
-						log.Println("dropped suppressed report")
+					for _, v := range []struct {
+						name string
+						c    chan map[string]interface{}
+						t    time.Duration
+						skip bool
+					}{
+						{"redis", t.json, p.conf.chanTimeoutRedis, p.conf.redisDisabled},
+						{"syslog", t.syslogjson, p.conf.chanTimeoutSyslog, p.conf.syslogDisabled},
+					} {
+						if v.skip { // skip if this sink is disabled
+							continue
+						}
+						switch PutWithTimeout(v.c, m, v.t) {
+						case errTimedOut:
+							if p.conf.debug {
+								log.Printf("dropped suppressed JSON->%s report after %v timeout", v.name, p.conf.chanTimeoutRedis)
+							}
+						case nil:
+							if p.conf.debug {
+								log.Printf("JSON->%s: %v", v.name, m)
+							}
+						}
 					}
+					// select {
+					// case t.json <- m:
+					// case <-time.After(ChanTimeout):
+					// 	log.Println("dropped suppressed report")
+					// }
 				}
 			}
 			dupes.Expire(p.conf.expireDupesAfter)
@@ -474,25 +501,27 @@ func dispatch(p *Publish, dupes *Messages) {
 		// If this is valid JSON, publish it to a JSON messages channel, else
 		// it goes to the plaintext channel.
 		if !validJSON { // Invalid JSON extracted from stdin
-			switch PutWithTimeout(t.json, m, p.conf.chanTimeoutRedis) {
-			case errTimedOut:
-				if p.conf.debug {
-					log.Printf("dropped PLAIN->redis message after %v timeout", p.conf.chanTimeoutRedis)
+			for _, v := range []struct {
+				name string
+				c    chan map[string]interface{}
+				t    time.Duration
+				skip bool
+			}{
+				{"redis", t.json, p.conf.chanTimeoutRedis, p.conf.redisDisabled},
+				{"syslog", t.syslogplaintext, p.conf.chanTimeoutSyslog, p.conf.syslogDisabled},
+			} {
+				if v.skip { // Skipping if this sink is disabled
+					continue
 				}
-			case nil:
-				if p.conf.debug {
-					log.Printf("PLAIN->redis: %v", m)
-				}
-			}
-			switch PutWithTimeout(
-				t.syslogplaintext, m, p.conf.chanTimeoutSyslog) {
-			case errTimedOut:
-				if p.conf.debug {
-					log.Printf("dropped PLAIN->syslog message after %v timeout", p.conf.chanTimeoutSyslog)
-				}
-			case nil:
-				if p.conf.debug {
-					log.Printf("PLAIN->syslog: %v", m)
+				switch PutWithTimeout(v.c, m, v.t) {
+				case errTimedOut:
+					if p.conf.debug {
+						log.Printf("dropped PLAIN->%s message after %v timeout", v.name, p.conf.chanTimeoutRedis)
+					}
+				case nil:
+					if p.conf.debug {
+						log.Printf("PLAIN->%s: %v", v.name, m)
+					}
 				}
 			}
 		} else { // Valid JSON extracted from stdin
@@ -538,24 +567,27 @@ func dispatch(p *Publish, dupes *Messages) {
 			// Send map with message contents to Redis and Syslog publishing
 			// goroutines. Timeout after specified interval by selecting on
 			// the supplied channel and a timer channel.
-			switch PutWithTimeout(t.json, m, p.conf.chanTimeoutRedis) {
-			case errTimedOut:
-				if p.conf.debug {
-					log.Printf("dropped JSON->redis message after %v timeout", p.conf.chanTimeoutRedis)
+			for _, v := range []struct {
+				name string
+				c    chan map[string]interface{}
+				t    time.Duration
+				skip bool
+			}{
+				{"redis", t.json, p.conf.chanTimeoutRedis, p.conf.redisDisabled},
+				{"syslog", t.syslogjson, p.conf.chanTimeoutSyslog, p.conf.syslogDisabled},
+			} {
+				if v.skip { // skip if this sink is disabled
+					continue
 				}
-			case nil:
-				if p.conf.debug {
-					log.Printf("JSON->redis: %v", m)
-				}
-			}
-			switch PutWithTimeout(t.syslogjson, m, p.conf.chanTimeoutSyslog) {
-			case errTimedOut:
-				if p.conf.debug {
-					log.Printf("dropped JSON->syslog message after %v timeout", p.conf.chanTimeoutRedis)
-				}
-			case nil:
-				if p.conf.debug {
-					log.Printf("JSON->syslog: %v", m)
+				switch PutWithTimeout(v.c, m, v.t) {
+				case errTimedOut:
+					if p.conf.debug {
+						log.Printf("dropped JSON->%s message after %v timeout", v.name, p.conf.chanTimeoutRedis)
+					}
+				case nil:
+					if p.conf.debug {
+						log.Printf("JSON->%s: %v", v.name, m)
+					}
 				}
 			}
 		}
@@ -841,6 +873,8 @@ func NewPublish(conf *args) *Publish {
 // SyslogFunc is a function prototype for a function returned from loggerfn.
 type SyslogFunc func(string) error
 
+// logWriterForLevel returns correct syslog function for the given level.
+// This aids in writing messages to syslog with correct severity level.
 func logWriterForLevel(levelStr string, w SyslogWriter) SyslogFunc {
 	var mapLevelToFunc = map[syslog.Priority]SyslogFunc{
 		syslog.LOG_CRIT:    w.Crit,
@@ -855,7 +889,7 @@ func logWriterForLevel(levelStr string, w SyslogWriter) SyslogFunc {
 	return mapLevelToFunc[level]
 }
 
-// SyslogWriter is an interface which for some reason does not exist in the go
+// SyslogWriter is an interface which for some reason does not exist in the Go
 // standard library's syslog package. This was added mainly to make testing
 // easier in the future.
 type SyslogWriter interface {
@@ -871,6 +905,7 @@ type SyslogWriter interface {
 	Debug(m string) error
 }
 
+// mapToSyslogWriter writes the given map to syslog as JSON-serialized message.
 func mapToSyslogWriter(
 	m map[string]interface{},
 	levelStr string,
@@ -883,22 +918,39 @@ func mapToSyslogWriter(
 	// Expect that message key could be either "msg" or "message".
 	// If neither is found, or not a string value, we abandon processing
 	// this particular object.
-	// var msg string
-	for _, k := range [...]string{"message", "msg"} {
-		if v, ok := getValue(k, m); ok {
-			fn := logWriterForLevel(m["level"].(string), w)
-			return fn(v)
-		}
+	fn := logWriterForLevel(m["level"].(string), w)
+	if b, err := json.Marshal(m); err != nil {
+		return err
+	} else {
+		return fn(string(b))
 	}
-	return errMissingMsgKey
+
+	// Originally, I was extracting the message out of the map, but instead
+	// decided to simply marshal the map into JSON and convert the byte slice
+	// into a string, which then gets written to syslog. This preserves much
+	// more context. It also makes syslog and redis a little more equal to
+	// each other.
+	// for _, k := range [...]string{"message", "msg"} {
+	// 	if v, ok := getValue(k, m); ok {
+	// 		fn := logWriterForLevel(m["level"].(string), w)
+	// 		return fn(v)
+	// 	}
+	// }
+	// return errMissingMsgKey
 }
 
 func (p *Publish) publishToSyslog(w SyslogWriter) {
 	for {
 		select {
-		case m := <-p.chans.syslogplaintext:
+		case m, ok := <-p.chans.syslogplaintext:
+			if !ok { // closed channel
+				return
+			}
 			mapToSyslogWriter(m, p.conf.SyslogLevelString(), w)
-		case m := <-p.chans.syslogjson:
+		case m, ok := <-p.chans.syslogjson:
+			if !ok { // closed channel
+				return
+			}
 			mapToSyslogWriter(m, p.conf.SyslogLevelString(), w)
 		case <-p.doneChan:
 			if p.conf.debug {
