@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"log/syslog"
+	"math"
 	"os"
 	"os/signal"
 	"regexp"
@@ -46,6 +47,7 @@ const (
 
 var errTimedOut = errors.New("Write failed with a timeout")
 var errMissingMsgKey = errors.New("Mapping missing required message key")
+var errInvalidPort = errors.New("Port must be a positive 16-bit integer")
 
 var levelsRegexp = struct {
 	debug *regexp.Regexp
@@ -112,6 +114,79 @@ func NewRedisConfig(name string) *RedisConfig {
 	return c
 }
 
+type SyslogConn int
+
+const (
+	Unixgram SyslogConn = iota
+	TCP
+	UDP
+)
+
+// String returns a string value for a given SyslogConn enum.
+// This method is required to implement the flag.Value interface.
+func (nt SyslogConn) String() string {
+	ntToStrMap := map[SyslogConn]string{
+		TCP:      "tcp",
+		UDP:      "udp",
+		Unixgram: "unixgram",
+	}
+	return ntToStrMap[nt]
+}
+
+// Set sets the SyslogConn value to given string, when valid, otherwise it
+// falls back to using unixgram. There is never an error here, due to fallback.
+// This method is required to implement the flag.Value interface.
+func (nt *SyslogConn) Set(arg string) error {
+	*nt = strToSyslogConn(arg)
+	return nil
+}
+
+func strToSyslogConn(netTypeStr string) SyslogConn {
+	strToNtMap := map[string]SyslogConn{
+		"tcp":      TCP,
+		"udp":      UDP,
+		"unixgram": Unixgram,
+		"unix":     Unixgram,
+	}
+	if v, ok := strToNtMap[strings.ToLower(netTypeStr)]; ok {
+		return v
+	}
+	return Unixgram // Fallback to unixgram when given
+}
+
+type Port uint16
+
+// String returns a string value for a given Port.
+// This method is required to implement the flag.Value interface.
+func (p Port) String() string {
+	return fmt.Sprintf("%d", p)
+}
+
+// Set sets the Port value to given string, when valid, otherwise it
+// returns a errInvalidPort error.
+// This method is required to implement the flag.Value interface.
+func (p *Port) Set(arg string) error {
+	port := atoi(arg)
+	if atoi(arg) <= 0 || atoi(arg) > math.MaxUint16 {
+		return errInvalidPort
+	}
+	*p = Port(port)
+	return nil
+}
+
+// atoi is a variant of the C implementation of the atoi function for converting
+// string representations of numbers into integer values.
+func atoi(s string) int {
+	if len(s) == 1 {
+		return int(s[0] - '0')
+	}
+	y := atoi(s[1:])
+	x := int(s[0] - '0')
+	pow := math.Pow(10., float64(len(s)-1))
+	x = (x * int(pow)) + y
+	return x
+}
+
 type args struct {
 	redisConfigFile   string
 	debug             bool
@@ -127,6 +202,9 @@ type args struct {
 	parserPattern     string
 	priority          string
 	tag               string
+	syslogSyslogConn  SyslogConn
+	syslogHost        string
+	syslogPort        Port
 }
 
 func (a *args) SyslogLevel() syslog.Priority {
@@ -135,6 +213,24 @@ func (a *args) SyslogLevel() syslog.Priority {
 
 func (a *args) SyslogLevelString() string {
 	return a.level
+}
+
+func (a args) SyslogNetworkString() string {
+	switch a.syslogSyslogConn {
+	case TCP:
+		return "tcp"
+	case UDP:
+		return "udp"
+	default:
+		return "unixgram"
+	}
+}
+
+func (a args) SyslogRAddrString() string {
+	if a.syslogSyslogConn == Unixgram {
+		return "/dev/log"
+	}
+	return fmt.Sprintf("%s:%d", a.syslogHost, a.syslogPort)
 }
 
 var cliArgs args
@@ -153,7 +249,15 @@ func setupCliFlags() {
 	flag.StringVar(&cliArgs.parserPattern, "pattern", DefaultParserPattern, "Pattern containing minimally a <msg> capture group")
 	flag.StringVar(&cliArgs.priority, "p", "daemon.notice", "Priority as 'facility.level' to use when message does not have one already")
 	flag.StringVar(&cliArgs.redisConfigFile, "redis.config.file", "redis.json", "Configuration file location with Redis db info")
+	flag.Var(&cliArgs.syslogSyslogConn, "syslog.conn", "One of three possible choices: tcp, udp, unixgram")
+	flag.Var(&cliArgs.syslogPort, "syslog.port", "Which port to use for syslog connection")
 	flag.Parse()
+	// If the flag holds an out of range value for cliArgs.syslogPort, an error
+	// will be raised when flags are parsed. Otherwise, we use the default
+	// syslog port, 514.
+	if cliArgs.syslogPort == 0 {
+		cliArgs.syslogPort = 514
+	}
 
 	cliArgs.level = "notice" // FIXME: should derive from CLI args
 }
@@ -831,18 +935,22 @@ type Publish struct {
 	doneChan    chan struct{}
 	statsChan   chan stat
 	source      string
+	numOfWorkers int
 	transform   Transformer
+}
+
+func (p *Publish) AckDone() {
+	p.ackDoneChan <- struct{}{}
 }
 
 // Close shuts down publishers, and should be called before terminating
 // the program.
 func (p *Publish) Close() {
-	const numOfWorkers = 3
 	close(p.doneChan)
 	// This blocks until all publishers acknowledge and corresponding
 	// goroutines return. We do not close any of the *topics channels to avoid
 	// a write on closed channel in the dispatch(...) goroutine.
-	for i := 0; i < numOfWorkers; i++ {
+	for i := 0; i < p.numOfWorkers; i++ {
 		<-p.ackDoneChan
 	}
 }
@@ -940,6 +1048,7 @@ func mapToSyslogWriter(
 }
 
 func (p *Publish) publishToSyslog(w SyslogWriter) {
+	defer p.AckDone() // join the main goroutine
 	for {
 		select {
 		case m, ok := <-p.chans.syslogplaintext:
@@ -956,7 +1065,6 @@ func (p *Publish) publishToSyslog(w SyslogWriter) {
 			if p.conf.debug {
 				log.Println("Shutting down publishToSyslog")
 			}
-			p.ackDoneChan <- struct{}{}
 			return
 		}
 	}
@@ -967,7 +1075,8 @@ type PubSubInterface interface {
 	Subscribe(channels ...string) *redis.PubSub
 }
 
-func (p *Publish) publishToDatabase(ps PubSubInterface) {
+func (p *Publish) publishToRedis(ps PubSubInterface) {
+	defer p.AckDone() // join the main goroutine
 	psValidate := ps.Subscribe("json_msgs")
 	var connected bool
 	var delay time.Duration = 1 * time.Second
@@ -977,9 +1086,8 @@ func (p *Publish) publishToDatabase(ps PubSubInterface) {
 		select {
 		case <-p.doneChan:
 			if p.conf.debug {
-				log.Println("Shutting down publishToDatabase")
+				log.Println("Shutting down publishToRedis")
 			}
-			p.ackDoneChan <- struct{}{}
 			return
 		default:
 			if _, err := psValidate.Receive(); err != nil {
@@ -1004,9 +1112,8 @@ func (p *Publish) publishToDatabase(ps PubSubInterface) {
 			ps.Publish("json_msgs", msgEncoded)
 		case <-p.doneChan:
 			if p.conf.debug {
-				log.Println("Shutting down publishToDatabase")
+				log.Println("Shutting down publishToRedis")
 			}
-			p.ackDoneChan <- struct{}{}
 			return
 		}
 	}
@@ -1025,35 +1132,48 @@ func main() {
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	go signalHandler(sigChan, doneChan)
 
-	redisConfig := NewRedisConfig(cliArgs.redisConfigFile).ToRedisOptions()
-	rdb := redis.NewClient(redisConfig)
-
-	sysLog, err := syslog.Dial(
-		// "tcp",
-		// "localhost:5514",
-		"unixgram",
-		"/dev/log",
-		strToPriority(
-			cliArgs.priority,
-			syslog.LOG_NOTICE,
-			syslog.LOG_DAEMON,
-		), cliArgs.tag)
-	if err != nil {
-		log.Fatal(err)
-	}
-
 	// Setup pipelines
 	p := NewPublish(&cliArgs)
+
+	// If we did not choose to disable Redis, setup the client, however the
+	// actual publisher setup happens in the p.publishToRedis(...) goroutine.
+	if !cliArgs.redisDisabled {
+		redisConfig := NewRedisConfig(cliArgs.redisConfigFile).ToRedisOptions()
+		rdb := redis.NewClient(redisConfig)
+		// Start Redis publishing goroutine
+		go p.publishToRedis(rdb)
+		p.numOfWorkers += 1
+	}
+
+	// If we did not choose to disable Syslog, setup connection.
+	if !cliArgs.syslogDisabled {
+		sysLog, err := syslog.Dial(
+			// "tcp",
+			// "localhost:5514",
+			// "unixgram",
+			// "/dev/log",
+			cliArgs.SyslogNetworkString(),
+			cliArgs.SyslogRAddrString(),
+			strToPriority(
+				cliArgs.priority,
+				syslog.LOG_NOTICE,
+				syslog.LOG_DAEMON,
+			), cliArgs.tag)
+		if err != nil {
+			log.Fatal(err)
+		}
+		// Start syslog publishing goroutine for Plaintext and JSON messages
+		go p.publishToSyslog(sysLog)
+		p.numOfWorkers += 1
+	}
 
 	// Initialize duplicate messages structure
 	dupes := NewMap()
 
 	// Start statistics processing goroutine
 	go p.stats()
-	// Start syslog writing goroutine for Plaintext and JSON messages to syslog
-	go p.publishToSyslog(sysLog)
-	// Start Redis publishing goroutine
-	go p.publishToDatabase(rdb)
+	p.numOfWorkers += 1
+
 	// Start dispatch goroutine (it feeds the publishing goroutines)
 	go dispatch(p, dupes)
 	// Start duplicate message processing goroutine
