@@ -800,7 +800,7 @@ func (p *Parser) MsgToMap(scnr *bufio.Scanner) map[string]interface{} {
 	// separator. This changes source to 'source.tag', which is useful in cases
 	// where we might have multiple instances of the same process running.
 	if v, ok := m["tag"]; ok {
-		m["source"] = p.conf.tag + "." + v
+		m["source"] = p.conf.tag + "." + v.(string)
 	}
 	m["source"] = p.conf.tag
 	m["ts"] = time.Now().Format(time.RFC3339Nano)
