@@ -399,6 +399,8 @@ func computeRatio(n, d int64) float64 {
 // field contains a name known to this utility.
 func (p *Publish) stats() {
 	const reportInterval = 10
+
+	defer p.AckDone() // join the main goroutine
 	// Counters is meant to be private, but it is "exported" in order to be
 	// JSON-marshal(able). In reality, it is not visible outside of this method.
 	type Counters struct {
@@ -454,7 +456,6 @@ func (p *Publish) stats() {
 			if p.conf.debug {
 				log.Println("Shutting down stats")
 			}
-			p.ackDoneChan <- struct{}{}
 			return
 		}
 	}
@@ -634,6 +635,13 @@ func dispatch(p *Publish, dupes *Messages) {
 			if _, ok := getValue("source", m); !ok {
 				m["source"] = p.source
 			}
+			// if there is a tag property add it to the source with a dot '.'
+			// as a separator. This changes source to 'source.tag', which is
+			// useful in cases where we might have multiple instances of the
+			// same process running.
+			if v, ok := getValue("tag", m); !ok {
+				m["source"] = p.source + "." + v
+			}
 			// Fallback to default key or key supplied via command line
 			// argument.
 			if _, ok := getValue("key", m); !ok {
@@ -787,6 +795,12 @@ func (p *Parser) MsgToMap(scnr *bufio.Scanner) map[string]interface{} {
 		m["ccs"] = true
 	} else {
 		m["ccs"] = false
+	}
+	// if there is a tag property add it to the source with a dot '.' as a
+	// separator. This changes source to 'source.tag', which is useful in cases
+	// where we might have multiple instances of the same process running.
+	if v, ok := m["tag"]; ok {
+		m["source"] = p.conf.tag + "." + v
 	}
 	m["source"] = p.conf.tag
 	m["ts"] = time.Now().Format(time.RFC3339Nano)
