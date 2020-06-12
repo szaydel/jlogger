@@ -2,12 +2,12 @@ package main
 
 import (
 	"bufio"
-	"bytes"
+	// "bytes"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
-	"io"
+	// "io"
 	"log"
 	"log/syslog"
 	"math"
@@ -250,7 +250,7 @@ func setupCliFlags() {
 	flag.StringVar(&cliArgs.tag, "t", "demotag", "Tag with which to publish messages")
 	flag.StringVar(&cliArgs.parserPattern, "pattern", DefaultParserPattern, "Pattern containing minimally a <msg> capture group")
 	flag.StringVar(&cliArgs.priority, "p", "daemon.notice", "Priority as 'facility.level' to use when message does not have one already")
-	flag.StringVar(&cliArgs.redisConfigFile, "redis.config.file", "redis.json", "Configuration file location with Redis db info")
+	flag.StringVar(&cliArgs.redisConfigFile, "redis.config.file", "redis.", "Configuration file location with Redis db info")
 	flag.Var(&cliArgs.syslogSyslogConn, "syslog.conn", "One of three possible choices: tcp, udp, unixgram")
 	flag.Var(&cliArgs.syslogPort, "syslog.port", "Which port to use for syslog connection")
 	flag.Parse()
@@ -354,233 +354,13 @@ func levelToStr(level syslog.Priority, defaultLevelStr string) string {
 	return defaultLevelStr
 }
 
-type stat uint16
 
-const (
-	Line = iota
-	Plain
-	Json
-	JsonNoMsg
-	Duplicate
-	Crit
-	Err
-	Warning
-	Notice
-	Info
-	Debug
-	Unknown
-)
-
-func levelToStat(levelStr string) stat {
-	mapLevelToStat := map[string]stat{
-		"crit":    Crit,
-		"err":     Err,
-		"error":   Err,
-		"warn":    Warning,
-		"warning": Warning,
-		"notice":  Notice,
-		"info":    Info,
-		"debug":   Debug,
-	}
-	if v, ok := mapLevelToStat[levelStr]; !ok {
-		return Unknown
-	} else {
-		return v
-	}
-}
 
 func computeRatio(n, d int64) float64 {
 	if n == 0 || d == 0 {
 		return 0.
 	}
 	return float64(n) / float64(d)
-}
-
-// Counters is meant to be private, but it is "exported" in order to be
-// JSON-marshal(able). In reality, it is not visible outside of this method.
-type Counters struct {
-	Line      int64 `json:"line"`
-	Plain     int64 `json:"plaintext"`
-	Json      int64 `json:"json_encoded"`
-	JsonNoMsg int64 `json:"json_encoded_missing_message"`
-	Duplicate int64 `json:"duplicate"`
-	Crit      int64 `json:"critical"`
-	Err       int64 `json:"error"`
-	Warning   int64 `json:"warning"`
-	Notice    int64 `json:"notice"`
-	Info      int64 `json:"info"`
-	Debug     int64 `json:"debug"`
-}
-
-type CounterDesc struct {
-	name        string
-	helpMsg     string
-	metricType  string
-	metricValue int64
-}
-
-func (c *Counters) WriteTo(w io.Writer) (int64, error) {
-	cdMap := map[stat]CounterDesc{
-		Crit: CounterDesc{
-			name:        "messages_level_crit_total",
-			helpMsg:     "Total number of messages logged with level CRITICAL",
-			metricType:  "counter",
-			metricValue: c.Crit,
-		},
-		Err: CounterDesc{
-			name:        "messages_level_err_total",
-			helpMsg:     "Total number of messages logged with level ERROR",
-			metricType:  "counter",
-			metricValue: c.Err,
-		},
-		Warning: CounterDesc{
-			name:        "messages_level_warn_total",
-			helpMsg:     "Total number of messages logged with level WARNING",
-			metricType:  "counter",
-			metricValue: c.Warning,
-		},
-		Notice: CounterDesc{
-			name:        "messages_level_notice_total",
-			helpMsg:     "Total number of messages logged with level NOTICE",
-			metricType:  "counter",
-			metricValue: c.Notice,
-		},
-		Info: CounterDesc{
-			name:        "messages_level_info_total",
-			helpMsg:     "Total number of messages logged with level INFO",
-			metricType:  "counter",
-			metricValue: c.Info,
-		},
-		Debug: CounterDesc{
-			name:        "messages_level_debug_total",
-			helpMsg:     "Total number of messages logged with level DEBUG",
-			metricType:  "counter",
-			metricValue: c.Debug,
-		},
-		Plain: CounterDesc{
-			name:        "plaintext_messages_total",
-			helpMsg:     "Total number of plaintext messages",
-			metricType:  "counter",
-			metricValue: c.Plain,
-		},
-		Json: CounterDesc{
-			name:        "json_encoded_messages_total",
-			helpMsg:     "Total number of JSON encoded messages",
-			metricType:  "counter",
-			metricValue: c.Json,
-		},
-		Duplicate: CounterDesc{
-			name:        "duplicate_messages_total",
-			helpMsg:     "Total number of messages recorded as duplicates",
-			metricType:  "counter",
-			metricValue: c.Duplicate,
-		},
-	}
-
-	return prometheusExpoWriter(w, cdMap)
-}
-
-func prometheusExpoWriter(
-	w io.Writer,
-	cdMap map[stat]CounterDesc) (int64, error) {
-	// Allocate a buffer and write all necessary lines to the buffer before
-	// sending the entire buffer to the supplied writer. This reduces the amount
-	// of accounting which we need to do here in terms of tracking bytes
-	// actually written. We just return result of a single WriteTo(...) with the
-	// supplied writer, after we fill the buffer with all required information.
-	var buf bytes.Buffer
-	for _, v := range []stat{
-		Crit,
-		Err,
-		Warning,
-		Notice,
-		Info,
-		Debug,
-		Plain,
-		Json,
-		Duplicate,
-	} {
-
-		if _, err := fmt.Fprintf(&buf, "# HELP %s %s\n",
-			cdMap[v].name, cdMap[v].helpMsg); err != nil {
-			return 0, err
-		}
-		if _, err := fmt.Fprintf(&buf, "# TYPE %s %s\n",
-			cdMap[v].name, cdMap[v].metricType); err != nil {
-			return 0, err
-		}
-		if _, err := fmt.Fprintf(&buf, "%s %d\n",
-			cdMap[v].name, cdMap[v].metricValue); err != nil {
-			return 0, err
-		}
-	}
-	return buf.WriteTo(w)
-}
-
-// stats tracks number of unique messages received. Levels are only extracted
-// from JSON messages where object contains field called "level", and that
-// field contains a name known to this utility.
-func (p *Publish) stats(w io.Writer) {
-	const reportInterval = 10
-
-	defer p.AckDone() // join the main goroutine
-	var counts [Unknown]int64
-	var t = time.NewTicker(reportInterval * time.Second).C
-	for {
-		select {
-		case <-t:
-			c := &Counters{
-				Line:      counts[Line],
-				Plain:     counts[Plain],
-				JsonNoMsg: counts[JsonNoMsg],
-				Json:      counts[Json],
-				Duplicate: counts[Duplicate],
-				Crit:      counts[Crit],
-				Err:       counts[Err],
-				Warning:   counts[Warning],
-				Notice:    counts[Notice],
-				Info:      counts[Info],
-				Debug:     counts[Debug],
-			}
-			c.WriteTo(w)
-			b, _ := json.Marshal(
-				map[string]interface{}{
-					"counts": Counters{
-						Line:      counts[Line],
-						Plain:     counts[Plain],
-						JsonNoMsg: counts[JsonNoMsg],
-						Json:      counts[Json],
-						Duplicate: counts[Duplicate],
-						Crit:      counts[Crit],
-						Err:       counts[Err],
-						Warning:   counts[Warning],
-						Notice:    counts[Notice],
-						Info:      counts[Info],
-						Debug:     counts[Debug],
-					},
-					"source": p.source,
-				},
-			)
-			if p.conf.debug {
-				log.Printf("STATS: %s", string(b))
-			}
-			// Reset the counts after proceessing and reporting stats. We may
-			// want to re-enable this, but right now I want to keep these as
-			// counters instead of gauges.
-			// for i, _ := range counts {
-			// 	counts[i] = 0
-			// }
-		case v := <-p.statsChan:
-			if v < Unknown {
-				counts[v]++
-			}
-		case <-p.doneChan:
-			if p.conf.debug {
-				log.Println("Shutting down stats")
-			}
-			return
-		}
-	}
 }
 
 // suppressedToMap creates a map which contains the original message body,
@@ -709,7 +489,7 @@ func dispatch(p *Publish, dupes *Messages) {
 		// only focus on the actual log text and ignore any associated metadata,
 		// otherwise we won't be able to detect duplicate messages.
 		if validJSON {
-			p.statsChan <- Json
+			p.statsChan <- JSON
 			var ok bool
 			if msgBody, ok = getMessageBytes(m); !ok {
 				log.Printf("Discarding, no 'message' key in: '%s'", scnr.Text())
@@ -1004,6 +784,7 @@ func (p *Parser) defaultRegexpMatchesToMap(results [][][]byte) (map[string]strin
 	return m, len(m) > 0
 }
 
+// KeyValueTuple is really an approximation of a "namedtuple" using a struct.
 type KeyValueTuple struct {
 	Key   string
 	Value string
@@ -1274,6 +1055,8 @@ func (s *PrometheusExpoWriter) Write(data []byte) (n int, err error) {
 	} else {
 		defer func() {
 			f.Close()
+			// To avoid partially written files during scrapes we write the file
+			// out with a temporary name and then rename it to desired name.
 			if err = os.Rename(tmpFilename, permFilename); err != nil {
 				log.Panic(err)
 			}
