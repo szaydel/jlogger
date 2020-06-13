@@ -128,7 +128,7 @@ func (c *Counters) WriteTo(w io.Writer) (int64, error) {
 	return c.prometheusExpoWriter(w, cdMap)
 }
 
-func(c *Counters) prometheusExpoWriter(
+func (c *Counters) prometheusExpoWriter(
 	w io.Writer,
 	cdMap map[stat]CounterDesc,
 ) (int64, error) {
