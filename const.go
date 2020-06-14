@@ -15,11 +15,13 @@ const (
 	ChanBufferLen = 10
 
 	// DefaultParserPattern should match any key=value sub-strings if there are
-	// any in the tail of the message.
+	// any in the tail of the message, enclosed with '[' and ']'.
 	// In other words if message is:
-	// "read failed function=alpha key=NotReadable", then the matched pairs
+	// "read failed [function=alpha key=NotReadable]", then the matched pairs
 	// will be function=alpha and key=NotReadable.
-	DefaultParserPattern = `(?m)(?P<message>^.*)\s\s|(?P<labels>\w+=\w+)`
+	// The default pattern will produce at least one named group: message and
+	// possibly repeating labels group. In RE2 lingo these are submatches.
+	DefaultParserPattern = `(?m)^(?P<message>[^\[\]]+\b)|(?P<labels>\b\S+=\S+\b)`
 
 	DefaultKey = "SyslogMessage"
 
