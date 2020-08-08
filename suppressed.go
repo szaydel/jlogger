@@ -30,7 +30,7 @@ func reportSuppressed(p *Publish, dupes *Messages) {
 						t    time.Duration
 						skip bool
 					}{
-						{"redis", t.json, p.conf.chanTimeoutRedis, p.conf.redisDisabled},
+						// {"redis", t.json, p.conf.chanTimeoutRedis, p.conf.redisDisabled},
 						{"syslog", t.syslogjson, p.conf.chanTimeoutSyslog, p.conf.syslogDisabled},
 					} {
 						if v.skip { // skip if this sink is disabled

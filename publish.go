@@ -2,18 +2,18 @@ package main
 
 import (
 	"bufio"
-	"encoding/json"
+	// "encoding/json"
 	"log"
 	"regexp"
-	"time"
+	// "time"
 
-	"github.com/go-redis/redis/v7"
+	// "github.com/go-redis/redis/v7"
 )
 
-type PubSubInterface interface {
-	Publish(channel string, message interface{}) *redis.IntCmd
-	Subscribe(channels ...string) *redis.PubSub
-}
+// type PubSubInterface interface {
+// 	Publish(channel string, message interface{}) *redis.IntCmd
+// 	Subscribe(channels ...string) *redis.PubSub
+// }
 
 type Transformer interface {
 	MsgToMap(scnr *bufio.Scanner) map[string]interface{}
@@ -102,46 +102,46 @@ func (p *Publish) publishToSyslog(w SyslogWriter) {
 	}
 }
 
-func (p *Publish) publishToRedis(ps PubSubInterface) {
-	defer p.AckDone() // join the main goroutine
-	psValidate := ps.Subscribe("json_msgs")
-	var connected bool
-	var delay time.Duration = 1 * time.Second
-	// Retry connecting to Redis indefinitely. Upon connection the library
-	// will take over and help to reconnect and re-subscribe as necessary.
-	for !connected {
-		select {
-		case <-p.doneChan:
-			if p.conf.debug {
-				log.Println("Shutting down publishToRedis")
-			}
-			return
-		default:
-			if _, err := psValidate.Receive(); err != nil {
-				log.Printf("Redis error %v", err)
-				time.Sleep(delay)
-				if delay < 30*time.Second {
-					delay += (delay/2 + 1)
-				}
-				if p.conf.debug {
-					log.Printf("Delaying reconnect by %v", delay)
-				}
-			} else {
-				connected = true
-			}
-		}
-	}
+// func (p *Publish) publishToRedis(ps PubSubInterface) {
+// 	defer p.AckDone() // join the main goroutine
+// 	psValidate := ps.Subscribe("json_msgs")
+// 	var connected bool
+// 	var delay time.Duration = 1 * time.Second
+// 	// Retry connecting to Redis indefinitely. Upon connection the library
+// 	// will take over and help to reconnect and re-subscribe as necessary.
+// 	for !connected {
+// 		select {
+// 		case <-p.doneChan:
+// 			if p.conf.debug {
+// 				log.Println("Shutting down publishToRedis")
+// 			}
+// 			return
+// 		default:
+// 			if _, err := psValidate.Receive(); err != nil {
+// 				log.Printf("Redis error %v", err)
+// 				time.Sleep(delay)
+// 				if delay < 30*time.Second {
+// 					delay += (delay/2 + 1)
+// 				}
+// 				if p.conf.debug {
+// 					log.Printf("Delaying reconnect by %v", delay)
+// 				}
+// 			} else {
+// 				connected = true
+// 			}
+// 		}
+// 	}
 
-	for {
-		select {
-		case msg := <-p.chans.json:
-			msgEncoded, _ := json.Marshal(msg)
-			ps.Publish("json_msgs", msgEncoded)
-		case <-p.doneChan:
-			if p.conf.debug {
-				log.Println("Shutting down publishToRedis")
-			}
-			return
-		}
-	}
-}
+// 	for {
+// 		select {
+// 		case msg := <-p.chans.json:
+// 			msgEncoded, _ := json.Marshal(msg)
+// 			ps.Publish("json_msgs", msgEncoded)
+// 		case <-p.doneChan:
+// 			if p.conf.debug {
+// 				log.Println("Shutting down publishToRedis")
+// 			}
+// 			return
+// 		}
+// 	}
+// }

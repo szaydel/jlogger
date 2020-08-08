@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"strings"
 	"time"
 )
 
@@ -37,7 +38,7 @@ func levelToStat(levelStr string) stat {
 		"info":    Info,
 		"debug":   Debug,
 	}
-	if v, ok := mapLevelToStat[levelStr]; !ok {
+	if v, ok := mapLevelToStat[strings.ToLower(levelStr)]; !ok {
 		return Unknown
 	} else {
 		return v

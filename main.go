@@ -7,7 +7,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/go-redis/redis/v7"
+	// "github.com/go-redis/redis/v7"
 )
 
 func signalHandler(sig chan os.Signal, done chan struct{}) {
@@ -28,13 +28,13 @@ func main() {
 
 	// If we did not choose to disable Redis, setup the client, however the
 	// actual publisher setup happens in the p.publishToRedis(...) goroutine.
-	if !cliArgs.redisDisabled {
-		redisConfig := NewRedisConfig(cliArgs.redisConfigFile).ToRedisOptions()
-		rdb := redis.NewClient(redisConfig)
-		// Start Redis publishing goroutine
-		go p.publishToRedis(rdb)
-		p.numOfWorkers += 1
-	}
+	// if !cliArgs.redisDisabled {
+	// 	redisConfig := NewRedisConfig(cliArgs.redisConfigFile).ToRedisOptions()
+	// 	rdb := redis.NewClient(redisConfig)
+	// 	// Start Redis publishing goroutine
+	// 	go p.publishToRedis(rdb)
+	// 	p.numOfWorkers += 1
+	// }
 
 	// If we did not choose to disable Syslog, setup connection.
 	if !cliArgs.syslogDisabled {

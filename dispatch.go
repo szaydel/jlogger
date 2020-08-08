@@ -68,7 +68,7 @@ func dispatch(p *Publish, dupes *Messages) {
 				t    time.Duration
 				skip bool
 			}{
-				{"redis", t.json, p.conf.chanTimeoutRedis, p.conf.redisDisabled},
+				// {"redis", t.json, p.conf.chanTimeoutRedis, p.conf.redisDisabled},
 				{"syslog", t.syslogplaintext, p.conf.chanTimeoutSyslog, p.conf.syslogDisabled},
 			} {
 				if v.skip { // Skipping if this sink is disabled
@@ -141,7 +141,7 @@ func dispatch(p *Publish, dupes *Messages) {
 				t    time.Duration
 				skip bool
 			}{
-				{"redis", t.json, p.conf.chanTimeoutRedis, p.conf.redisDisabled},
+				// {"redis", t.json, p.conf.chanTimeoutRedis, p.conf.redisDisabled},
 				{"syslog", t.syslogjson, p.conf.chanTimeoutSyslog, p.conf.syslogDisabled},
 			} {
 				if v.skip { // skip if this sink is disabled

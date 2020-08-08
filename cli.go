@@ -8,11 +8,11 @@ import (
 )
 
 type args struct {
-	redisConfigFile   string
+	// redisConfigFile   string
 	debug             bool
 	ignoreMissingMsg  bool
 	syslogDisabled    bool
-	redisDisabled     bool
+	// redisDisabled     bool
 	chanBufLen        int
 	chanTimeoutRedis  time.Duration
 	chanTimeoutSyslog time.Duration
@@ -57,7 +57,7 @@ func setupCliFlags() {
 	flag.IntVar(&cliArgs.chanBufLen, "channel.buffer.length", ChanBufferLen, "How many messages to allow in the buffer before discards may happen")
 	flag.BoolVar(&cliArgs.debug, "debug", false, "Enable debugging")
 	flag.BoolVar(&cliArgs.ignoreMissingMsg, "ignore.missing.msg", false, "Do not look for a message key after parsing lines")
-	flag.BoolVar(&cliArgs.redisDisabled, "redis.disabled", false, "Skip publishing to redis when set")
+	// flag.BoolVar(&cliArgs.redisDisabled, "redis.disabled", false, "Skip publishing to redis when set")
 	flag.BoolVar(&cliArgs.syslogDisabled, "syslog.disabled", false, "Skip publishing to syslog when set")
 	flag.DurationVar(&cliArgs.chanTimeoutRedis, "redis.timeout.ms", ChanTimeout, "Set timeout value for sending messages to Redis")
 	flag.DurationVar(&cliArgs.chanTimeoutSyslog, "syslog.timeout.ms", ChanTimeout, "Set timeout value for sending messages to Syslog")
@@ -66,7 +66,7 @@ func setupCliFlags() {
 	flag.StringVar(&cliArgs.tag, "t", "demotag", "Tag with which to publish messages")
 	flag.StringVar(&cliArgs.parserPattern, "pattern", DefaultParserPattern, "Pattern containing minimally a <msg> capture group")
 	flag.StringVar(&cliArgs.priority, "p", "daemon.notice", "Priority as 'facility.level' to use when message does not have one already")
-	flag.StringVar(&cliArgs.redisConfigFile, "redis.config.file", "redis.", "Configuration file location with Redis db info")
+	// flag.StringVar(&cliArgs.redisConfigFile, "redis.config.file", "redis.", "Configuration file location with Redis db info")
 	flag.Var(&cliArgs.syslogSyslogConn, "syslog.conn", "One of three possible choices: tcp, udp, unixgram")
 	flag.Var(&cliArgs.syslogPort, "syslog.port", "Which port to use for syslog connection")
 	flag.Parse()
