@@ -53,9 +53,11 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		// Start syslog publishing goroutine for Plaintext and JSON messages
+		// Start syslog publishing goroutines for Plaintext and JSON messages
 		go p.publishToSyslog(sysLog)
-		p.numOfWorkers += 1
+		go p.publishToSyslog(sysLog)
+		go p.publishToSyslog(sysLog)
+		p.numOfWorkers += 3
 	}
 
 	// Initialize duplicate messages structure

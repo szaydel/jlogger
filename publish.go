@@ -5,7 +5,7 @@ import (
 	// "encoding/json"
 	"log"
 	"regexp"
-	// "time"
+	"time"
 
 	// "github.com/go-redis/redis/v7"
 )
@@ -80,6 +80,10 @@ func NewPublish(conf *args) *Publish {
 }
 
 func (p *Publish) publishToSyslog(w SyslogWriter) {
+	id := time.Now().Nanosecond()
+	if p.conf.debug {
+		log.Printf("publishToSyslog (%d): started", id)
+	}
 	defer p.AckDone() // join the main goroutine
 	for {
 		select {
@@ -87,10 +91,16 @@ func (p *Publish) publishToSyslog(w SyslogWriter) {
 			if !ok { // closed channel
 				return
 			}
+			if p.conf.debug {
+				log.Printf("publishToSyslog (%d): plaintext", id)
+			}
 			mapToSyslogWriter(m, p.conf.SyslogLevelString(), w)
 		case m, ok := <-p.chans.syslogjson:
 			if !ok { // closed channel
 				return
+			}
+			if p.conf.debug {
+				log.Printf("publishToSyslog (%d): json", id)
 			}
 			mapToSyslogWriter(m, p.conf.SyslogLevelString(), w)
 		case <-p.doneChan:
