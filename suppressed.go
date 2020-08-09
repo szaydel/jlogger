@@ -20,10 +20,11 @@ func reportSuppressed(p *Publish, dupes *Messages) {
 			delta := time.Now().Sub(timestamp)
 			for v := range dupes.Iter() {
 				if v.count > 0 {
-					m := suppressedToMap(v, delta)
+					m := suppressedToMap(v, time.Now().Sub(v.timestamp))
 					m["suppressed_per_sec"] = float64(m["suppressed"].(uint64)) / delta.Seconds()
 					m["source"] = p.source
 					m["key"] = "SuppressedMessage"
+					m["suppressed_msg"] = string(v.data)
 					for _, v := range []struct {
 						name string
 						c    chan map[string]interface{}
@@ -55,7 +56,7 @@ func reportSuppressed(p *Publish, dupes *Messages) {
 				}
 			}
 			dupes.Expire(p.conf.expireDupesAfter)
-			timestamp = time.Now() // update timestamp for next report
+			// timestamp = time.Now() // update timestamp for next report
 		}
 	}
 }
@@ -63,7 +64,8 @@ func reportSuppressed(p *Publish, dupes *Messages) {
 // suppressedToMap creates a map which contains the original message body,
 // and if original was decoded JSON, then only contents of "msg" or "message"
 // field, or entire message if original was not valid JSON, and includes number
-// of times this message occurred over a given period in seconds.
+// of times this message occurred plus the amount of time since a duplicate
+// message was last observed.
 func suppressedToMap(m *Message, td time.Duration) map[string]interface{} {
 	var dup = make(map[string]interface{})
 	if !json.Valid(m.data) {
@@ -73,12 +75,12 @@ func suppressedToMap(m *Message, td time.Duration) map[string]interface{} {
 	}
 	// Regardless of message content, we consider these to be informational.
 	dup["level"] = "info"
-	dup["period"] = td.String()
+	dup["since_last_seen"] = td.String()
 	dup["suppressed"] = m.count
 	if (time.Duration(m.count) * time.Second / td) > 1 {
-		dup["alert"] = true
+		dup["flood"] = true
 	} else {
-		dup["alert"] = false
+		dup["flood"] = false
 	}
 	dup["ts"] = time.Now().Format(time.RFC3339Nano)
 	return dup
