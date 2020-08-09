@@ -60,9 +60,9 @@ func (m *Messages) Insert(b []byte) bool {
 // Iter is an iterator-like method for data in the duplicate messages map.
 func (m *Messages) Iter() chan *Message {
 	m.mtx.Lock()
-	defer m.mtx.Unlock()
 	c := make(chan *Message, 1)
 	go func() {
+		defer m.mtx.Unlock()
 		for _, v := range m.cm {
 			c <- v
 		}
