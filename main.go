@@ -5,6 +5,7 @@ import (
 	"log/syslog"
 	"os"
 	"os/signal"
+	"runtime/pprof"
 	"syscall"
 )
 
@@ -20,6 +21,17 @@ func main() {
 	doneChan := make(chan struct{})
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	go signalHandler(sigChan, doneChan)
+
+	// Setup profiling if enabled
+	if cliArgs.CPUProfileEnabled() {
+		log.Printf("Writing CPU profiling data to: %s", cliArgs.cpuprofile)
+		f, err := os.Create(cliArgs.cpuprofile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
+	}
 
 	// Setup pipelines
 	p := NewPublish(&cliArgs)

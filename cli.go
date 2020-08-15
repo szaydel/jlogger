@@ -18,6 +18,7 @@ type args struct {
 	chanTimeoutRedis  time.Duration
 	chanTimeoutSyslog time.Duration
 	expireDupesAfter  time.Duration
+	cpuprofile        string
 	key               string
 	level             string // not implemented yet
 	parserPattern     string
@@ -27,6 +28,10 @@ type args struct {
 	syslogSyslogConn  SyslogConn
 	syslogHost        string
 	syslogPort        Port
+}
+
+func (a args) CPUProfileEnabled() bool {
+	return a.cpuprofile != ""
 }
 
 func (a *args) SyslogLevel() syslog.Priority {
@@ -68,6 +73,7 @@ func setupCliFlags() {
 	flag.DurationVar(&cliArgs.chanTimeoutRedis, "redis.timeout.ms", ChanTimeout, "Set timeout value for sending messages to Redis")
 	flag.DurationVar(&cliArgs.chanTimeoutSyslog, "syslog.timeout.ms", ChanTimeout, "Set timeout value for sending messages to Syslog")
 	flag.DurationVar(&cliArgs.expireDupesAfter, "expire.dupes.after.s", DefaultExpireDupesAfter, "Amount of time after which previously seen message is not a duplicate")
+	flag.StringVar(&cliArgs.cpuprofile, "cpuprofile", "", "If a value is given, it is assumed to be a file to which CPU profile data is written")
 	flag.StringVar(&cliArgs.key, "key", DefaultKey, "Key with which to publish messages")
 	flag.StringVar(&cliArgs.tag, "t", "demotag", "Tag with which to publish messages")
 	flag.StringVar(&cliArgs.parserPattern, "pattern", DefaultParserPattern, "Pattern containing minimally a <msg> capture group")
