@@ -19,13 +19,15 @@ type Parser struct {
 // default pattern or pattern supplied via command line argument.
 func (p *Parser) MsgToMap(scnr *bufio.Scanner) map[string]interface{} {
 	m := make(map[string]interface{})
-	results, ok := p.parse(scnr.Bytes())
-	if ok {
-		for k, v := range results {
-			if IsBoolType(v) {
-				m[k] = StringToBool(v)
-			} else {
-				m[k] = v
+	if !p.conf.noRegexp {
+		results, ok := p.parse(scnr.Bytes())
+		if ok {
+			for k, v := range results {
+				if IsBoolType(v) {
+					m[k] = StringToBool(v)
+				} else {
+					m[k] = v
+				}
 			}
 		}
 	}
