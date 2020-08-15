@@ -12,6 +12,7 @@ type args struct {
 	debug             bool
 	ignoreMissingMsg  bool
 	syslogDisabled    bool
+	loggerCompatStdin bool // unused, only here for API compatibility
 	// redisDisabled     bool
 	chanBufLen        int
 	chanTimeoutRedis  time.Duration
@@ -37,12 +38,16 @@ func (a *args) SyslogLevelString() string {
 
 func (a args) SyslogNetworkString() string {
 	switch a.syslogSyslogConn {
+	case Local:
+		return ""
 	case TCP:
 		return "tcp"
 	case UDP:
 		return "udp"
-	default:
+	case Unixgram:
 		return "unixgram"
+	default:
+		return ""
 	}
 }
 
@@ -67,8 +72,9 @@ func setupCliFlags() {
 	flag.StringVar(&cliArgs.parserPattern, "pattern", DefaultParserPattern, "Pattern containing minimally a <msg> capture group")
 	flag.StringVar(&cliArgs.priority, "p", "daemon.notice", "Priority as 'facility.level' to use when message does not have one already")
 	// flag.StringVar(&cliArgs.redisConfigFile, "redis.config.file", "redis.", "Configuration file location with Redis db info")
-	flag.Var(&cliArgs.syslogSyslogConn, "syslog.conn", "One of three possible choices: tcp, udp, unixgram")
+	flag.Var(&cliArgs.syslogSyslogConn, "syslog.conn", "One of four possible choices: tcp, udp, unixgram, local")
 	flag.Var(&cliArgs.syslogPort, "syslog.port", "Which port to use for syslog connection")
+	flag.BoolVar(&cliArgs.loggerCompatStdin, "i", false, "Compatibility only")
 	flag.Parse()
 	// If the flag holds an out of range value for cliArgs.syslogPort, an error
 	// will be raised when flags are parsed. Otherwise, we use the default

@@ -184,9 +184,10 @@ func mapToSyslogWriter(
 type SyslogConn int
 
 const (
-	Unixgram SyslogConn = iota
+	Local SyslogConn = iota
 	TCP
 	UDP
+	Unixgram
 )
 
 // String returns a string value for a given SyslogConn enum.
@@ -196,6 +197,7 @@ func (nt SyslogConn) String() string {
 		TCP:      "tcp",
 		UDP:      "udp",
 		Unixgram: "unixgram",
+		Local:    "", // Empty string signals local syslog to syslog stdlib
 	}
 	return ntToStrMap[nt]
 }
@@ -214,6 +216,8 @@ func strToSyslogConn(netTypeStr string) SyslogConn {
 		"udp":      UDP,
 		"unixgram": Unixgram,
 		"unix":     Unixgram,
+		"":         Local,
+		"local":    Local,
 	}
 	if v, ok := strToNtMap[strings.ToLower(netTypeStr)]; ok {
 		return v

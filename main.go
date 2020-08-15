@@ -6,8 +6,6 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-
-	// "github.com/go-redis/redis/v7"
 )
 
 func signalHandler(sig chan os.Signal, done chan struct{}) {
@@ -38,18 +36,26 @@ func main() {
 
 	// If we did not choose to disable Syslog, setup connection.
 	if !cliArgs.syslogDisabled {
-		sysLog, err := syslog.Dial(
-			// "tcp",
-			// "localhost:5514",
-			// "unixgram",
-			// "/dev/log",
-			cliArgs.SyslogNetworkString(),
-			cliArgs.SyslogRAddrString(),
-			strToPriority(
-				cliArgs.priority,
-				syslog.LOG_NOTICE,
-				syslog.LOG_DAEMON,
-			), cliArgs.tag)
+		var sysLog *syslog.Writer
+		var err error
+		var pri = strToPriority(
+			cliArgs.priority,
+			syslog.LOG_NOTICE,
+			syslog.LOG_DAEMON)
+
+		if strToSyslogConn(cliArgs.SyslogNetworkString()) == Local {
+			sysLog, err = syslog.New(pri, cliArgs.tag)
+		} else {
+			sysLog, err = syslog.Dial(
+				// "tcp",
+				// "localhost:5514",
+				// "unixgram",
+				// "/dev/log",
+				cliArgs.SyslogNetworkString(),
+				cliArgs.SyslogRAddrString(),
+				pri, cliArgs.tag)
+		}
+
 		if err != nil {
 			log.Fatal(err)
 		}
