@@ -70,7 +70,7 @@ func main() {
 	dupes := NewMap()
 
 	// Start statistics processing goroutine
-	pw := NewPrometheusExportWriter("/run/jlogger", cliArgs.tag)
+	pw := NewPrometheusExportWriter(cliArgs.statsDir, cliArgs.tag)
 	go p.stats(pw)
 	p.numOfWorkers += 1
 

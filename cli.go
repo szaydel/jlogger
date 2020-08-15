@@ -23,6 +23,7 @@ type args struct {
 	parserPattern     string
 	priority          string
 	tag               string
+	statsDir          string
 	syslogSyslogConn  SyslogConn
 	syslogHost        string
 	syslogPort        Port
@@ -72,6 +73,7 @@ func setupCliFlags() {
 	flag.StringVar(&cliArgs.parserPattern, "pattern", DefaultParserPattern, "Pattern containing minimally a <msg> capture group")
 	flag.StringVar(&cliArgs.priority, "p", "daemon.notice", "Priority as 'facility.level' to use when message does not have one already")
 	// flag.StringVar(&cliArgs.redisConfigFile, "redis.config.file", "redis.", "Configuration file location with Redis db info")
+	flag.StringVar(&cliArgs.statsDir, "stats.dir", "/run/jlogger", "Directory where to place the stats file")
 	flag.Var(&cliArgs.syslogSyslogConn, "syslog.conn", "One of four possible choices: tcp, udp, unixgram, local")
 	flag.Var(&cliArgs.syslogPort, "syslog.port", "Which port to use for syslog connection")
 	flag.BoolVar(&cliArgs.loggerCompatStdin, "i", false, "Compatibility only")
