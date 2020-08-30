@@ -13,7 +13,7 @@ type args struct {
 	ignoreMissingMsg  bool
 	syslogDisabled    bool
 	loggerCompatStdin bool // unused, only here for API compatibility
-	noRegexp          bool
+	enableRegEx          bool
 	// redisDisabled     bool
 	chanBufLen        int
 	chanTimeoutRedis  time.Duration
@@ -84,7 +84,7 @@ func setupCliFlags() {
 	flag.Var(&cliArgs.syslogSyslogConn, "syslog.conn", "One of four possible choices: tcp, udp, unixgram, local")
 	flag.Var(&cliArgs.syslogPort, "syslog.port", "Which port to use for syslog connection")
 	flag.BoolVar(&cliArgs.loggerCompatStdin, "i", false, "Compatibility only")
-	flag.BoolVar(&cliArgs.noRegexp, "no.regexp", false, "Should regexp matching be disabled?")
+	flag.BoolVar(&cliArgs.enableRegEx, "enable.regex", false, "Should regexp matching be enabled?")
 	flag.Parse()
 	// If the flag holds an out of range value for cliArgs.syslogPort, an error
 	// will be raised when flags are parsed. Otherwise, we use the default

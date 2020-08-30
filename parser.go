@@ -16,10 +16,11 @@ type Parser struct {
 
 // MsgToMap takes a pointer to a buffer from the dispatch(...) function and
 // attempts to extract a few details by parsing the message either using the
-// default pattern or pattern supplied via command line argument.
+// default pattern or pattern supplied via command line argument, if regex is
+// enabled. Otherwise defaults provided via the arguments are used instead.
 func (p *Parser) MsgToMap(scnr *bufio.Scanner) map[string]interface{} {
 	m := make(map[string]interface{})
-	if !p.conf.noRegexp {
+	if p.conf.enableRegEx {
 		results, ok := p.parse(scnr.Bytes())
 		if ok {
 			for k, v := range results {
@@ -31,9 +32,13 @@ func (p *Parser) MsgToMap(scnr *bufio.Scanner) map[string]interface{} {
 			}
 		}
 	}
+	// There should probably be an 'else' here, where we build up the message
+	// without checking for presence of a given propery.
 
 	setValueWhenMissing("key", p.conf.key, m)
 	var level syslog.Priority
+	// There is no checking here for validity of the level string.
+	// It is something that might be needed in the future.
 	if _, ok := m["level"]; !ok {
 		level = detectLevel(scnr, levelsRegexp)
 		m["level"] = levelToStr(level, p.conf.level)
@@ -43,13 +48,14 @@ func (p *Parser) MsgToMap(scnr *bufio.Scanner) map[string]interface{} {
 	} else {
 		m["ccs"] = false
 	}
-	// if there is a tag property add it to the source with a dot '.' as a
+	// If there is a tag property add it to the source with a dot '.' as a
 	// separator. This changes source to 'source.tag', which is useful in cases
 	// where we might have multiple instances of the same process running.
 	if v, ok := m["tag"]; ok {
 		m["source"] = p.conf.tag + "." + v.(string)
+	} else {
+		m["source"] = p.conf.tag
 	}
-	m["source"] = p.conf.tag
 	m["ts"] = time.Now().Format(time.RFC3339Nano)
 	m["plaintext"] = true
 
