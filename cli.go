@@ -71,7 +71,7 @@ func setupCliFlags() {
 	flag.BoolVar(&cliArgs.ignoreMissingMsg, "ignore.missing.msg", false, "Do not look for a message key after parsing lines")
 	// flag.BoolVar(&cliArgs.redisDisabled, "redis.disabled", false, "Skip publishing to redis when set")
 	flag.BoolVar(&cliArgs.syslogDisabled, "syslog.disabled", false, "Skip publishing to syslog when set")
-	flag.DurationVar(&cliArgs.chanTimeoutRedis, "redis.timeout.ms", ChanTimeout, "Set timeout value for sending messages to Redis")
+	// flag.DurationVar(&cliArgs.chanTimeoutRedis, "redis.timeout.ms", ChanTimeout, "Set timeout value for sending messages to Redis")
 	flag.DurationVar(&cliArgs.chanTimeoutSyslog, "syslog.timeout.ms", ChanTimeout, "Set timeout value for sending messages to Syslog")
 	flag.DurationVar(&cliArgs.expireDupesAfter, "expire.dupes.after.s", DefaultExpireDupesAfter, "Amount of time after which previously seen message is not a duplicate")
 	flag.StringVar(&cliArgs.cpuprofile, "cpuprofile", "", "If a value is given, it is assumed to be a file to which CPU profile data is written")
