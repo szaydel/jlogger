@@ -13,7 +13,7 @@ type args struct {
 	ignoreMissingMsg  bool
 	syslogDisabled    bool
 	loggerCompatStdin bool // unused, only here for API compatibility
-	enableRegEx          bool
+	enableRegEx       bool
 	// redisDisabled     bool
 	chanBufLen        int
 	chanTimeoutRedis  time.Duration
@@ -29,6 +29,7 @@ type args struct {
 	syslogSyslogConn  SyslogConn
 	syslogHost        string
 	syslogPort        Port
+	workerCount       uint
 }
 
 func (a args) CPUProfileEnabled() bool {
@@ -82,15 +83,23 @@ func setupCliFlags() {
 	// flag.StringVar(&cliArgs.redisConfigFile, "redis.config.file", "redis.", "Configuration file location with Redis db info")
 	flag.StringVar(&cliArgs.statsDir, "stats.dir", "/run/jlogger", "Directory where to place the stats file")
 	flag.Var(&cliArgs.syslogSyslogConn, "syslog.conn", "One of four possible choices: tcp, udp, unixgram, local")
+	flag.StringVar(&cliArgs.syslogHost, "syslog.host", "localhost", "Which host to use for syslog connection")
 	flag.Var(&cliArgs.syslogPort, "syslog.port", "Which port to use for syslog connection")
 	flag.BoolVar(&cliArgs.loggerCompatStdin, "i", false, "Compatibility only")
 	flag.BoolVar(&cliArgs.enableRegEx, "enable.regex", false, "Should regexp matching be enabled?")
+	flag.UintVar(&cliArgs.workerCount, "worker.count", 3, "Number of concurrent processing workers")
 	flag.Parse()
 	// If the flag holds an out of range value for cliArgs.syslogPort, an error
 	// will be raised when flags are parsed. Otherwise, we use the default
 	// syslog port, 514.
 	if cliArgs.syslogPort == 0 {
 		cliArgs.syslogPort = 514
+	}
+
+	// Limit worker count if the number is seemingly unreasonable. There is very
+	// little benefit to having a very large number of processors.
+	if cliArgs.workerCount > MaximumConcurrentWorkers {
+		cliArgs.workerCount = MaximumConcurrentWorkers
 	}
 
 	cliArgs.level = "notice" // FIXME: should derive from CLI args

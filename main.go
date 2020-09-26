@@ -56,8 +56,14 @@ func main() {
 			syslog.LOG_DAEMON)
 
 		if strToSyslogConn(cliArgs.SyslogNetworkString()) == Local {
+			if cliArgs.debug {
+				log.Println("Local syslog connection")
+			}
 			sysLog, err = syslog.New(pri, cliArgs.tag)
 		} else {
+			if cliArgs.debug {
+				log.Printf("Remote syslog connection to %s:%d", cliArgs.syslogHost, cliArgs.syslogPort)
+			}
 			sysLog, err = syslog.Dial(
 				// "tcp",
 				// "localhost:5514",
@@ -72,10 +78,10 @@ func main() {
 			log.Fatal(err)
 		}
 		// Start syslog publishing goroutines for Plaintext and JSON messages
-		go p.publishToSyslog(sysLog)
-		go p.publishToSyslog(sysLog)
-		go p.publishToSyslog(sysLog)
-		p.numOfWorkers += 3
+		for i := 0; i < int(cliArgs.workerCount); i++ {
+			go p.publishToSyslog(sysLog)
+			p.numOfWorkers += 1
+		}
 	}
 
 	// Initialize duplicate messages structure

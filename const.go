@@ -30,4 +30,14 @@ const (
 	// if this value is N, and two identical messages are logged N + 1 units
 	// of time apart, they will not be considered duplicates.
 	DefaultExpireDupesAfter = 10 * time.Second
+
+	// DefaultConcurrentWorkers is the number of concurrently executing message
+	// forwarding goroutines. Theses are the routines which receive messages
+	// from the actual processing goroutine and are responsible for delivery of
+	// messages to the target.
+	DefaultConcurrentWorkers = 3
+
+	// MaximumConcurrentWorkers sets an upper limit on the number of currently
+	// executing message forwarding goroutines.
+	MaximumConcurrentWorkers = 100
 )
